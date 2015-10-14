@@ -153,13 +153,17 @@ netmap_monitor_rxsync(struct netmap_kring *kring, int flags)
 }
 
 /* nm_krings_create callbacks for monitors.
- * We could use the default netmap_hw_krings_zmon, but
- * we don't need the mbq.
  */
 static int
 netmap_monitor_krings_create(struct netmap_adapter *na)
 {
-	return netmap_krings_create(na, 0);
+	int error = netmap_krings_create(na, 0);
+	if (error)
+		return error;
+	/* override the host rings callbacks */
+	na->tx_rings[na->num_tx_rings].nm_sync = netmap_monitor_txsync;
+	na->rx_rings[na->num_rx_rings].nm_sync = netmap_monitor_rxsync;
+	return 0;
 }
 
 /* nm_krings_delete callback for monitors */
@@ -322,7 +326,7 @@ netmap_monitor_stop(struct netmap_adapter *na)
 	for_rx_tx(t) {
 		u_int i;
 
-		for (i = 0; i < nma_get_nrings(na, t); i++) {
+		for (i = 0; i < nma_get_nrings(na, t) + 1; i++) {
 			struct netmap_kring *kring = &NMR(na, t)[i];
 			u_int j;
 
@@ -701,6 +705,7 @@ netmap_get_monitor_na(struct nmreq *nmr, struct netmap_adapter **na, int create)
 	struct nmreq pnmr;
 	struct netmap_adapter *pna; /* parent adapter */
 	struct netmap_monitor_adapter *mna;
+	struct ifnet *ifp = NULL;
 	int i, error;
 	enum txrx t;
 	int zcopy = (nmr->nr_flags & NR_ZCOPY_MON);
@@ -727,7 +732,7 @@ netmap_get_monitor_na(struct nmreq *nmr, struct netmap_adapter **na, int create)
 	 */
 	memcpy(&pnmr, nmr, sizeof(pnmr));
 	pnmr.nr_flags &= ~(NR_MONITOR_TX | NR_MONITOR_RX);
-	error = netmap_get_na(&pnmr, &pna, create);
+	error = netmap_get_na(&pnmr, &pna, &ifp, create);
 	if (error) {
 		D("parent lookup failed: %d", error);
 		return error;
@@ -848,10 +853,14 @@ netmap_get_monitor_na(struct nmreq *nmr, struct netmap_adapter **na, int create)
 	/* keep the reference to the parent */
 	D("monitor ok");
 
+	/* drop the reference to the ifp, if any */
+	if (ifp)
+		if_rele(ifp);
+
 	return 0;
 
 put_out:
-	netmap_adapter_put(pna);
+	netmap_unget_na(pna, ifp);
 	free(mna, M_DEVBUF);
 	return error;
 }
