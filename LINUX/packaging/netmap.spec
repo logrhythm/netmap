@@ -4,8 +4,8 @@ Release:       %{buildnumber}%{?dist}
 Summary:       netmap for Network Monitor
 Group:         Development/Tools
 License:       Dual BSD/GPL
-BuildRequires: kernel-devel = 2.6.32-573.7.1
-Requires:      kernel = 2.6.32-573.7.1
+BuildRequires: kernel-devel = 2.6.32-573.7.1.el6
+Requires:      kernel = 2.6.32-573.7.1.el6
 ExclusiveArch: x86_64
 
 %description
@@ -26,6 +26,10 @@ cd %{name}/LINUX/
 PATH=/usr/local/probe/bin:$PATH
 ./configure --no-drivers
 make
+
+%install
+mkdir -p $RPM_BUILD_ROOT/lib/modules/2.6.32-573.7.1.el6.x86_64/extra/
+cd ~/rpmbuild/BUILD/%{name}/LINUX
 make install
 
 /bin/mkdir -p $RPM_BUILD_ROOT/usr/local/probe/include/netmap
