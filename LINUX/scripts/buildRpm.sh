@@ -3,7 +3,7 @@ set -e
 PACKAGE=netmap
 
 if [[ $# -gt 3 || $# -lt 2 ]] ; then
-    echo 'Usage:  sh buildRpm <BRANCH> <BUILD_NUMBER> <NETMAP-GIT-USER<optional>>'
+    echo 'Usage:  sh buildRpm <VERSION> <BUILD_NUMBER> <NETMAP-GIT-USER<optional>>'
     exit 0
 fi
  
@@ -17,7 +17,7 @@ else
 fi
 echo "USER IS $USER";
 
-echo "Building netmap for  USER: $USER, NETMAP BRANCH: $VERSION"
+echo "Building netmap for  USER: $USER, NETMAP VERSION: $VERSION"
 
 
 

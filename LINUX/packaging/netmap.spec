@@ -37,6 +37,12 @@ cd ~/rpmbuild/BUILD/%{name}/
 
 %post
 depmod -a
+grep -q "modprobe netmap.ko" /etc/rc.modules 2&>1 > /dev/null
+if [ $? -ne 0 ]
+then
+   echo modprobe netmap.ko >> /etc/rc.modules
+fi
+chmod +x /etc/rc.modules
 
 %preun
 
