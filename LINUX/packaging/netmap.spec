@@ -28,9 +28,9 @@ PATH=/usr/local/probe/bin:$PATH
 make
 
 %install
-/bin/mkdir -p $RPM_BUILD_ROOT/lib/modules/2.6.32-573.7.1.el6.x86_64/extra/
+/bin/mkdir -p $RPM_BUILD_ROOT/lib/modules/@KERNEL_VERSION@.x86_64/extra/
 cd ~/rpmbuild/BUILD/%{name}/
-/bin/cp LINUX/netmap.ko $RPM_BUILD_ROOT/lib/modules/2.6.32-573.7.1.el6.x86_64/extra/
+/bin/cp LINUX/netmap.ko $RPM_BUILD_ROOT/lib/modules/@KERNEL_VERSION@.x86_64/extra/
 
 /bin/mkdir -p $RPM_BUILD_ROOT/usr/local/probe/include/netmap
 /bin/cp sys/net/*.h $RPM_BUILD_ROOT/usr/local/probe/include/netmap
@@ -51,4 +51,4 @@ chmod +x /etc/rc.modules
 %files
 %defattr(-,root,root,-)
 /usr/local/probe/include/netmap
-/lib/modules/2.6.32-573.7.1.el6.x86_64/extra/
+/lib/modules/@KERNEL_VERSION@.x86_64/extra/
