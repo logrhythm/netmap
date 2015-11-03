@@ -35,6 +35,9 @@ cd ~/rpmbuild/BUILD/%{name}/
 /bin/mkdir -p $RPM_BUILD_ROOT/usr/local/probe/include/netmap
 /bin/cp sys/net/*.h $RPM_BUILD_ROOT/usr/local/probe/include/netmap
 
+/bin/mkdir -p $RPM_BUILD_ROOT/etc/udev/rules.d/
+echo 'KERNEL=="netmap", MODE="0666"' > $RPM_BUILD_ROOT/etc/udev/rules.d/010_netmap.rules
+
 %post
 depmod -a
 grep -q "modprobe netmap.ko" /etc/rc.modules 2&>1 > /dev/null
@@ -52,3 +55,4 @@ chmod +x /etc/rc.modules
 %defattr(-,root,root,-)
 /usr/local/probe/include/netmap
 /lib/modules/@KERNEL_VERSION@.x86_64/extra/
+/etc/udev/rules.d/
