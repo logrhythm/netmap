@@ -36,7 +36,7 @@ cd ~/rpmbuild/BUILD/%{name}/
 /bin/cp sys/net/*.h $RPM_BUILD_ROOT/usr/local/probe/include/netmap
 
 /bin/mkdir -p $RPM_BUILD_ROOT/etc/udev/rules.d/
-echo 'KERNEL=="netmap", MODE="0666"' > $RPM_BUILD_ROOT/etc/udev/rules.d/010_netmap.rules
+echo 'KERNEL=="netmap", GROUP="dpi"' > $RPM_BUILD_ROOT/etc/udev/rules.d/010_netmap.rules
 
 %post
 depmod -a
