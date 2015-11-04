@@ -2,22 +2,15 @@
 set -e
 PACKAGE=netmap
 
-if [[ $# -gt 3 || $# -lt 2 ]] ; then
-    echo 'Usage:  sh buildRpm <VERSION> <BUILD_NUMBER> <NETMAP-GIT-USER<optional>>'
+if [ $# -ne 2 ] ; then
+    echo 'Usage:  sh buildRpm <VERSION> <BUILD_NUMBER>'
     exit 0
 fi
  
 VERSION="$1"
 BUILD="$2"
 
-if [ $# -eq 3 ]; then
-   USER=$3
-else
-   USER="LogRhythm"
-fi
-echo "USER IS $USER";
-
-echo "Building netmap for  USER: $USER, NETMAP VERSION: $VERSION"
+echo "Building netmap version: $VERSION $BUILD"
 
 PWD=`pwd`
 CWD=$PWD/$PACKAGE
@@ -31,8 +24,7 @@ KERNEL=`uname -r`
 sed -e 's/@KERNEL_VERSION@/'${KERNEL%.x86_64}'/g'  packaging/netmap.spec > ~/rpmbuild/SPECS/netmap.spec
 
 cd ..
-rm -f $PACKAGE-$VERSION*.tar.gz
 tar czf $PACKAGE-$VERSION.$BUILD.tar.gz ./*
-cp $PACKAGE-$VERSION.$BUILD.tar.gz ~/rpmbuild/SOURCES
+mv $PACKAGE-$VERSION.$BUILD.tar.gz ~/rpmbuild/SOURCES
 cd ~/rpmbuild
-rpmbuild -v -bb --define="version ${VERSION}" --define="netmapuser {$USER}" --define="buildnumber {$BUILD}" --target=x86_64 ~/rpmbuild/SPECS/$PACKAGE.spec
+rpmbuild -v -bb --define="version ${VERSION}" --define="buildnumber {$BUILD}" --target=x86_64 ~/rpmbuild/SPECS/$PACKAGE.spec
