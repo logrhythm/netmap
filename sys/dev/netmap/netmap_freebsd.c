@@ -55,6 +55,7 @@
 #include <sys/proc.h> /* PROC_LOCK() */
 #include <sys/unistd.h> /* RFNOWAIT */
 #include <sys/sched.h> /* sched_bind() */
+#include <sys/smp.h> /* mp_maxid */
 #include <net/if.h>
 #include <net/if_var.h>
 #include <net/if_types.h> /* IFT_ETHER */
@@ -331,6 +332,11 @@ nm_os_generic_find_num_queues(struct ifnet *ifp, u_int *txq, u_int *rxq)
 	*rxq = netmap_generic_rings;
 }
 
+int
+nm_os_generic_rxsg_supported(void)
+{
+	return 1; /* Supported through m_copydata. */
+}
 
 void
 nm_os_mitigation_init(struct nm_generic_mit *mit, int idx, struct netmap_adapter *na)
@@ -949,6 +955,11 @@ out:
 
 /******************** kthread wrapper ****************/
 #include <sys/sysproto.h>
+u_int
+nm_os_ncpus(void)
+{
+	return mp_maxid + 1;
+}
 
 struct nm_kthread_ctx {
 	struct thread *user_td;		/* thread user-space (kthread creator) to send ioctl */
