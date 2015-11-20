@@ -680,6 +680,7 @@ struct netmap_adapter {
 	void (*nm_dtor)(struct netmap_adapter *);
 
 	int (*nm_register)(struct netmap_adapter *, int onoff);
+	void (*nm_intr)(struct netmap_adapter *, int onoff);
 
 	int (*nm_txsync)(struct netmap_kring *kring, int flags);
 	int (*nm_rxsync)(struct netmap_kring *kring, int flags);
@@ -851,6 +852,9 @@ struct netmap_generic_adapter {	/* emulated device */
 #ifdef linux
         netdev_tx_t (*save_start_xmit)(struct mbuf *, struct ifnet *);
 #endif
+	/* Is the adapter able to use multiple RX slots to scatter
+	 * each packet pushed up by the driver? */
+	int rxsg;
 };
 #endif  /* WITH_GENERIC */
 
@@ -861,7 +865,7 @@ netmap_real_rings(struct netmap_adapter *na, enum txrx t)
 }
 
 #ifdef WITH_VALE
-
+struct nm_bdg_polling_state;
 /*
  * Bridge wrapper for non VALE ports attached to a VALE switch.
  *
@@ -919,9 +923,9 @@ struct netmap_bwrap_adapter {
 	 * are attached to a bridge.
 	 */
 	struct netmap_priv_d *na_kpriv;
+	struct nm_bdg_polling_state *na_polling_state;
 };
 int netmap_bwrap_attach(const char *name, struct netmap_adapter *);
-
 
 #endif /* WITH_VALE */
 
@@ -1741,6 +1745,7 @@ struct nm_os_gen_arg {
 int nm_os_generic_xmit_frame(struct nm_os_gen_arg *);
 int nm_os_generic_find_num_desc(struct ifnet *ifp, u_int *tx, u_int *rx);
 void nm_os_generic_find_num_queues(struct ifnet *ifp, u_int *txq, u_int *rxq);
+int nm_os_generic_rxsg_supported(void);
 
 static inline struct ifnet*
 netmap_generic_getifp(struct netmap_generic_adapter *gna)
@@ -1871,7 +1876,8 @@ uint16_t nm_os_csum_fold(rawsum_t cur_sum);
 
 void bdg_mismatch_datapath(struct netmap_vp_adapter *na,
 			   struct netmap_vp_adapter *dst_na,
-			   struct nm_bdg_fwd *ft_p, struct netmap_ring *ring,
+			   const struct nm_bdg_fwd *ft_p,
+			   struct netmap_ring *dst_ring,
 			   u_int *j, u_int lim, u_int *howmany);
 
 /* persistent virtual port routines */
@@ -1901,6 +1907,7 @@ void nm_os_kthread_delete(struct nm_kthread *);
 void nm_os_kthread_wakeup_worker(struct nm_kthread *nmk);
 void nm_os_kthread_send_irq(struct nm_kthread *);
 void nm_os_kthread_set_affinity(struct nm_kthread *, int);
+u_int nm_os_ncpus(void);
 
 #ifdef WITH_PTNETMAP_HOST
 /*
