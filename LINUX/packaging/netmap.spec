@@ -32,8 +32,8 @@ make
 cd ~/rpmbuild/BUILD/%{name}/
 /bin/cp LINUX/netmap.ko $RPM_BUILD_ROOT/lib/modules/@KERNEL_VERSION@.x86_64/extra/
 
-/bin/mkdir -p $RPM_BUILD_ROOT/usr/local/probe/include/netmap
-/bin/cp sys/net/*.h $RPM_BUILD_ROOT/usr/local/probe/include/netmap
+/bin/mkdir -p $RPM_BUILD_ROOT/usr/local/probe/include/net
+/bin/cp sys/net/*.h $RPM_BUILD_ROOT/usr/local/probe/include/net
 
 /bin/mkdir -p $RPM_BUILD_ROOT/etc/udev/rules.d/
 echo 'KERNEL=="netmap", GROUP="dpi"' > $RPM_BUILD_ROOT/etc/udev/rules.d/010_netmap.rules
@@ -53,6 +53,6 @@ chmod +x /etc/rc.modules
 
 %files
 %defattr(-,root,root,-)
-/usr/local/probe/include/netmap
+/usr/local/probe/include/net
 /lib/modules/@KERNEL_VERSION@.x86_64/extra/
 /etc/udev/rules.d/
