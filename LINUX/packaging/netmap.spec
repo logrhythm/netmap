@@ -47,6 +47,13 @@ then
 fi
 chmod +x /etc/rc.modules
 
+# Load netmap if it is not currently loaded
+/sbin/lsmod | grep -q netmap
+if [ $? -ne 0 ]
+then
+   modprobe netmap
+fi
+
 %preun
 
 %postun
