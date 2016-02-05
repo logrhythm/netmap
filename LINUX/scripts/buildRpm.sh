@@ -28,8 +28,11 @@ sed -e 's/@KERNEL_VERSION@/'${KERNEL%.x86_64}'/g'  packaging/netmap.spec > ~/rpm
 
 GCC5_KERNEL_FILE="/usr/src/kernels/${KERNEL}/include/linux/compiler-gcc5.h"
 echo "kernel file: $GCC5_KERNEL_FILE"
-sudo touch $GCC5_KERNEL_FILE
-echo "#include <linux/compiler-gcc4.h>" | sudo tee --append "$GCC5_KERNEL_FILE"
+if [ ! -f "$GCC5_KERNEL_FILE" ]; then
+   sudo touch $GCC5_KERNEL_FILE
+   echo "#include <linux/compiler-gcc4.h>" | sudo tee --append "$GCC5_KERNEL_FILE"
+fi
+
 
 cd ..
 tar czf $PACKAGE-$VERSION.$BUILD.tar.gz ./*
