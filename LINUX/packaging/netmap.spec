@@ -12,7 +12,6 @@ ExclusiveArch: x86_64
 
 %prep
 cd ~/rpmbuild/BUILD
-/bin/rm -rf %{name}
 /bin/mkdir %{name}
 cd %{name}
 /bin/tar xzf ~/rpmbuild/SOURCES/%{name}-%{version}.%{buildnumber}.tar.gz
@@ -21,11 +20,9 @@ if [ $? -ne 0 ]; then
 fi
 
 %build
-# SKIP_BUILD_RPATH, CMAKE_SKIP_BUILD_RPATH, 
 cd %{name}/LINUX/
-PATH=/usr/local/probe/bin:$PATH
-./configure --no-drivers
-make
+./configure --no-drivers --cc=/usr/local/probe/bin/gcc
+make CONFIG_MODULE_SIG=n
 
 %install
 /bin/mkdir -p $RPM_BUILD_ROOT/lib/modules/@KERNEL_VERSION@.x86_64/extra/
