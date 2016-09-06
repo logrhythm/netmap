@@ -37,9 +37,7 @@ echo 'KERNEL=="netmap", GROUP="dpi"' > $RPM_BUILD_ROOT/etc/udev/rules.d/010_netm
 
 %post
 depmod -a
-grep -q "modprobe netmap" /etc/rc.modules 2&>1 > /dev/null
-if [ $? -ne 0 ]
-then
+if ! grep -q "modprobe netmap" /etc/rc.modules 2>/dev/null; then
    echo modprobe netmap >> /etc/rc.modules
 fi
 chmod +x /etc/rc.modules
