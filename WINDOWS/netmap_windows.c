@@ -85,7 +85,7 @@ ioctlCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     NMG_LOCK();
     priv = irpSp->FileObject->FsContext;
     if (priv == NULL) {
-	priv = malloc(sizeof (*priv), M_DEVBUF, M_NOWAIT | M_ZERO); // could wait
+	priv = nm_os_malloc(sizeof (*priv)); // could wait
 	if (priv == NULL) {
 	    status = STATUS_INSUFFICIENT_RESOURCES;
 	} else {
@@ -218,8 +218,15 @@ windows_handle_rx(struct net_device *ifp, uint32_t length, const char *data)
 {
 	struct mbuf *m = win_make_mbuf(ifp, length, data);
 
-	if (m)
-		generic_rx_handler(ifp, m);
+	if (m) {
+		int stolen = generic_rx_handler(ifp, m);
+
+		if (!stolen) {
+			m_freem(m);
+			/* XXX Should we return m instead of freeing it? */
+		}
+	}
+
 	return NULL;
 }
 
@@ -237,6 +244,53 @@ windows_handle_tx(struct net_device *ifp, uint32_t length, const char *data)
 	return NULL;
 }
 
+/*
+ * we default to always allocating and zeroing
+ */
+void *
+nm_os_malloc(size_t size)
+{
+    void* mem = ExAllocatePoolWithTag(NonPagedPool, size, /* M_DEVBUF */ 2);
+
+    if (mem != NULL) {
+        RtlZeroMemory(mem, size);
+    }
+    return mem;
+}
+
+void
+nm_os_free(void *addr)
+{
+    ExFreePoolWithTag(addr, /* M_DEVBUF */ 2);
+}
+
+void *
+nm_os_realloc(void *src, size_t size, size_t oldSize)
+{
+    //DbgPrint("Netmap.sys: win_reallocate(%p, %i, %i)", src, size, oldSize);
+    PVOID newBuff = NULL; /* default return value */
+
+    if (src == NULL) { /* if size > 0, this is a malloc */
+        if (size > 0) {
+            newBuff = nm_os_malloc(size);
+        }
+    } else if (size == 0) {
+        nm_os_free(src);
+    } else if (size == oldSize) {
+        newBuff = src;
+    } else { /* realloc -- XXX later maybe ignore shrink ? */
+        newBuff = nm_os_malloc(size);
+        if (newBuff != NULL) {
+            if (size <= oldSize) { /* shrink, just copy back part of the data */
+                RtlCopyMemory(newBuff, src, size);
+            } else {
+                RtlCopyMemory(newBuff, src, oldSize);
+            }
+        }
+    }
+    return newBuff;
+}
+
 int
 nm_os_catch_rx(struct netmap_generic_adapter *gna, int intercept)
 {
@@ -251,15 +305,17 @@ nm_os_catch_rx(struct netmap_generic_adapter *gna, int intercept)
 }
 
 
-void
-nm_os_catch_tx(struct netmap_generic_adapter *gna, int enable)
+int
+nm_os_catch_tx(struct netmap_generic_adapter *gna, int intercept)
 {
     struct netmap_adapter *na = &gna->up.up;
     int *p = na->ifp->intercept;
 
     if (p != NULL) {
-	*p = enable ? (*p | NM_WIN_CATCH_TX) : (*p & ~NM_WIN_CATCH_TX);
+	*p = intercept ? (*p | NM_WIN_CATCH_TX) : (*p & ~NM_WIN_CATCH_TX);
     }
+
+    return 0;
 }
 
 /*
@@ -289,6 +345,18 @@ nm_os_send_up(struct ifnet *ifp, struct mbuf *m, struct mbuf *prev)
 	return head;
 }
 
+int
+MBUF_TRANSMIT(struct netmap_adapter *na, struct ifnet *ifp, struct mbuf *m)
+{
+	if (ndis_hooks.injectPacket == NULL) {
+		return 0;
+	}
+	if (ndis_hooks.injectPacket(ifp->pfilter, NULL, 0, TRUE, m)) {
+                return 0;
+        }
+        return -1;
+}
+
 /*
  * Transmit routine used by generic_netmap_txsync(). Returns 0 on success
  * and <> 0 on error (which may be packet drops or other errors).
@@ -306,11 +374,11 @@ nm_os_generic_xmit_frame(struct nm_os_gen_arg *a)
 		a->tail = cur;
 		if (a->head == NULL)
 			a->head = cur;
+		return 0;
 	}
-	else {
-		return NDIS_STATUS_BUFFER_OVERFLOW;
-	}
-	return  0;
+
+	/* NDIS_STATUS_BUFFER_OVERFLOW */
+	return -1;
 }
 
 /*
@@ -333,10 +401,12 @@ nm_os_generic_find_num_queues(struct ifnet *ifp, u_int *txq, u_int *rxq)
     *rxq = 1;
 }
 
-int
-nm_os_generic_rxsg_supported(void)
+void
+nm_os_generic_set_features(struct netmap_generic_adapter *gna)
 {
-	return 0; /* No support for now. */
+	/* No support for now. */
+	gna->rxsg = 0;
+	gna->txqdisc = 0;
 }
 //
 
@@ -550,7 +620,7 @@ ifunit_ref(const char* name)
     deviceIfIndex = getDeviceIfIndex(name+3);
     if (deviceIfIndex < 0)
 	return NULL;
-    ifp = malloc(sizeof(struct net_device), M_DEVBUF, M_NOWAIT | M_ZERO);
+    ifp = nm_os_malloc(sizeof(struct net_device));
     if (ifp == NULL)
 	return NULL;
 
@@ -562,7 +632,7 @@ ifunit_ref(const char* name)
 	win32_init_lookaside_buffers(ifp);
 
 	if (ndis_hooks.ndis_regif(ifp) != STATUS_SUCCESS) {
-	free(ifp, M_DEVBUF);
+	nm_os_free(ifp);
 	win32_clear_lookaside_buffers(ifp);
 	return NULL; /* not found */
     }
@@ -871,7 +941,7 @@ generic_timer_handler(struct hrtimer *t)
 	mit->mit_pending = 0;
 	/* below is a variation of netmap_generic_irq  XXX revise */
 	if (nm_netmap_on(mit->mit_na)) {
-		netmap_common_irq(mit->mit_na->ifp, mit->mit_ring_idx, &work_done);
+		netmap_common_irq(mit->mit_na, mit->mit_ring_idx, &work_done);
 		generic_rate(0, 0, 0, 0, 0, 1);
 	}
 	nm_os_mitigation_restart(mit);
@@ -922,5 +992,68 @@ void nm_os_mitigation_cleanup(struct nm_generic_mit *mit)
 	//mit->mit_timer.active = FALSE;
 	//KeCancelTimer(&mit->mit_timer.timer);
 	//hrtimer_cancel(&mit->mit_timer);
+}
+
+u_int
+nm_os_ncpus(void)
+{
+	return 1;  // TODO
+}
+
+int
+nm_os_mbuf_has_offld(struct mbuf *m)
+{
+	return 0;  // TODO
+}
+
+void
+nm_os_get_module(void)
+{
+	// TODO
+}
+
+void
+nm_os_put_module(void)
+{
+	// TODO
+}
+
+
+struct nm_kthread {
+    int unused; /* To avoid compiler barfs */
+};
+
+void
+nm_os_kthread_set_affinity(struct nm_kthread *nmk, int affinity)
+{
+	// TODO
+}
+
+struct nm_kthread *
+nm_os_kthread_create(struct nm_kthread_cfg *cfg, unsigned int cfgtype,
+		     void *opaque)
+{
+	// TODO
+	return NULL;
+}
+
+int
+nm_os_kthread_start(struct nm_kthread *nmk)
+{
+	// TODO
+	return -1;
+}
+
+void
+nm_os_kthread_stop(struct nm_kthread *nmk)
+{
+	// TODO
+}
+
+
+void
+nm_os_kthread_delete(struct nm_kthread *nmk)
+{
+	// TODO
 }
 

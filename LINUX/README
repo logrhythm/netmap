@@ -18,9 +18,9 @@ of the code and documentation as well as pre-built TinyCore
 images based on linux 3.0.3 and containing the netmap modules
 and some test applications.
 
-This version supports r8169, ixgbe, igb, e1000, e1000e and forcedeth.
+This version supports r8169, ixgbe, igb, i40e, e1000, e1000e and forcedeth.
 
-Netmap relies on a kernel module (netmap_lin.ko) and slightly modified
+Netmap relies on a kernel module (netmap.ko) and slightly modified
 device drivers. Userspace programs can use the native API (documented
 in netmap.4) or a libpcap emulation library.
 
@@ -28,9 +28,16 @@ The FreeBSD and Linux versions share the same codebase, which
 is located in ../sys . For Linux we use some additional glue code,
 (bsd_glue.h).
 
-Device drivers are taken directly from the Linux distributions,
-and patched using the files in the patches/ directory.
-Common driver modifications are in the .h files in this directory.
+Device drivers are taken directly from either the Linux distributions,
+or the Intel out-of-tree drivers, and patched using the files in
+the patches/ directory.  Common driver modifications are in the .h
+files in this directory. Note that the patches for e1000, forcedeth,
+virtio-net have been prepared on the vanilla kernel: this is usually
+sufficient for Debian/Ubuntu, but it often fails on Red Hat/CentOS.
+The patches for igb, e1000e, ixgbe and i40e, instead, are against
+a specific version of the out-of-tree Intel drivers, and should compile
+without any problem on the same systems where the original drivers do.
+
 
 
 HOW TO BUILD THE CODE
@@ -38,23 +45,22 @@ HOW TO BUILD THE CODE
 
 1. make sure you have kernel sources/headers matching your installed system
 
-2. do the following
+2. do the following (either here, or in the parent directory)
 	./configure
 	make
-   this produces ./netmap_lin.ko and other kernel modules.
+   this produces ./netmap.ko and other kernel modules.
    (If your kernel sources are not in standard places, follow the
     instructions in the errors output by ./configure)
 
-3. to build sample applications, run
-	make apps
-   (you will need the pthreads and libpcap-dev packages to build them)
+   This also builds a few netmap applications.  (you will need the
+   pthreads and libpcap-dev packages to build them)
 
 If you want support for additional drivers please have a look at
 ixgbe_netmap_linux.h and the patches in patches/
 The patch file are named as diff--DRIVER--LOW--HIGH--otherstuff
 where DRIVER is the driver name to patch, LOW and HIGH are the
 versions to which the patch applies (LOW included, HIGH excluded, so
-diff--r8169.c--20638--30300--ok applies from 2.6.38 to 3.3.0 (excluded)
+vanilla--r8169.c--20638--30300--ok applies from 2.6.38 to 3.3.0 (excluded)
 
 HOW TO USE THE CODE
 -------------------
@@ -72,7 +78,7 @@ TinyCore image, the following steps can be used for initial testing:
 	...
 
 2. load netmap and device driver module
-	sudo insmod ./netmap_lin.ko
+	sudo insmod ./netmap.ko
 	sudo insmod ./ixgbe/ixgbe.ko
 	sudo insmod ./e1000/e1000.ko
 	...
@@ -122,6 +128,36 @@ COMMON PROBLEMS
 * the ixgbe driver (and perhaps others) is severely slowed down if the
   remote party is senting flow control frames to slow down traffic.
   If that happens try to use the ethtool command to disable flow control.
+
+* netmap does not program the NICs to perform offloadings such as TSO,
+  UFO, RX/TX checksum offloadings, etc. As a result, in order to let
+  netmap applications correctly interact with the host rings, you need
+  to disable these offloadings
+
+      # ethtool -K eth0 tx off rx off gso off tso off gro off lro off
+
+  If offloadings are not disabled, the network stack may try to send
+  GSO packets (up to 64KB) that are dropped by netmap (as they are
+  too big for the netmap buffers); or the network stack could send
+  unchecksummed packets that end up in the host RX ring, and if
+  transmitted by netmap on a NIC TX ring they will be dropped by the
+  destination as the checksum is wrong.
+
+* if you are using netmap to implement an L2 switch (e.g. using the
+  bridge application), you must put the NIC in promiscuous mode,
+  otherwise the NIC (usually) drops all the frames whose destination
+  MAC is different from the MAC of the NIC.
+
+      # ip link set eth0 promisc on
+
+* if you are receiving VLAN-tagged packets, netmap applications (with
+  patched drivers) may not see the VLAN tag because receive VLAN offloading
+  is enabled (and so VLAN tags are stripped by the NIC). To disable it use
+
+      # ethtool -K eth0 rxvlan off
+
+  In emulated netmap mode (i.e. with unpatched drivers) VLAN tags are never
+  visible by the netmap application.
 
 
 REVISION HISTORY

@@ -1,5 +1,6 @@
 /*
- * Copyright (C) 2013-2014 Vincenzo Maffione. All rights reserved.
+ * Copyright (C) 2013-2014 Vincenzo Maffione
+ * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -28,8 +29,8 @@
  */
 
 
-#ifndef __NETMAP_MBQ_H__
-#define __NETMAP_MBQ_H__
+#ifndef _NET_NETMAP_MBQ_H__
+#define _NET_NETMAP_MBQ_H__
 
 /*
  * These function implement an mbuf tailq with an optional lock.
@@ -81,6 +82,7 @@ mbq_unlock(struct mbq *q)
 	mtx_unlock_spin(&q->lock);
 }
 
+
 void mbq_safe_init(struct mbq *q);
 void mbq_safe_fini(struct mbq *q);
 void mbq_safe_enqueue(struct mbq *q, struct mbuf *m);
@@ -92,4 +94,4 @@ static inline unsigned int mbq_len(struct mbq *q)
     return q->count;
 }
 
-#endif /* __NETMAP_MBQ_H_ */
+#endif /* _NET_NETMAP_MBQ_H_ */
