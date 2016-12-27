@@ -172,7 +172,7 @@ netmap_pipe_remove(struct netmap_adapter *parent, struct netmap_pipe_adapter *na
 	parent->na_pipes[n] = NULL;
 }
 
-static int
+int
 netmap_pipe_txsync(struct netmap_kring *txkring, int flags)
 {
         struct netmap_kring *rxkring = txkring->pipe;
@@ -237,7 +237,7 @@ netmap_pipe_txsync(struct netmap_kring *txkring, int flags)
 	return 0;
 }
 
-static int
+int
 netmap_pipe_rxsync(struct netmap_kring *rxkring, int flags)
 {
         struct netmap_kring *txkring = rxkring->pipe;
@@ -286,7 +286,7 @@ netmap_pipe_rxsync(struct netmap_kring *rxkring, int flags)
  */
 
 
-/* netmap_pipe_krings_delete.
+/* netmap_pipe_krings_create.
  *
  * There are two cases:
  *
@@ -331,8 +331,8 @@ netmap_pipe_krings_create(struct netmap_adapter *na)
 		for_rx_tx(t) {
 			enum txrx r = nm_txrx_swap(t); /* swap NR_TX <-> NR_RX */
 			for (i = 0; i < nma_get_nrings(na, t); i++) {
-				NMR(na, t)[i].pipe = NMR(&pna->peer->up, r) + i;
-				NMR(&pna->peer->up, r)[i].pipe = NMR(na, t) + i;
+				NMR(na, t)[i].pipe = NMR(ona, r) + i;
+				NMR(ona, r)[i].pipe = NMR(na, t) + i;
 			}
 		}
 
@@ -394,7 +394,7 @@ netmap_pipe_reg(struct netmap_adapter *na, int onoff)
 				struct netmap_kring *kring = &NMR(na, t)[i];
 
 				if (nm_kring_pending_on(kring)) {
-					/* mark the partner ring as needed */
+					/* mark the peer ring as needed */
 					kring->pipe->nr_kflags |= NKR_NEEDRING;
 				}
 			}
@@ -491,7 +491,7 @@ netmap_pipe_krings_delete(struct netmap_adapter *na)
 		return;
 	}
 	/* case 1) above */
-	ND("%p: case 1, deleting everyhing", na);
+	ND("%p: case 1, deleting everything", na);
 	netmap_krings_delete(na); /* also zeroes tx_rings etc. */
 	ona = &pna->peer->up;
 	if (ona->tx_rings == NULL) {
@@ -529,7 +529,7 @@ netmap_get_pipe_na(struct nmreq *nmr, struct netmap_adapter **na, int create)
 	struct ifnet *ifp = NULL;
 	u_int pipe_id;
 	int role = nmr->nr_flags & NR_REG_MASK;
-	int error;
+	int error, retries = 0;
 
 	ND("flags %x", nmr->nr_flags);
 
@@ -544,12 +544,28 @@ netmap_get_pipe_na(struct nmreq *nmr, struct netmap_adapter **na, int create)
 	memcpy(&pnmr.nr_name, nmr->nr_name, IFNAMSIZ);
 	/* pass to parent the requested number of pipes */
 	pnmr.nr_arg1 = nmr->nr_arg1;
-	error = netmap_get_na(&pnmr, &pna, &ifp, create);
-	if (error) {
-		ND("parent lookup failed: %d", error);
-		return error;
+	for (;;) {
+		int create_error;
+
+		error = netmap_get_na(&pnmr, &pna, &ifp, create);
+		if (!error)
+			break;
+		if (error != ENXIO || retries++) {
+			D("parent lookup failed: %d", error);
+			return error;
+		}
+		D("try to create a persistent vale port");
+		/* create a persistent vale port and try again */
+		NMG_UNLOCK();
+		create_error = netmap_vi_create(&pnmr, 1 /* autodelete */);
+		NMG_LOCK();
+		if (create_error) {
+			if (create_error != EOPNOTSUPP) {
+				D("failed to create a persistent vale port: %d", create_error);
+			}
+			return error;
+		}
 	}
-	ND("found parent: %s", na->name);
 
 	if (NETMAP_OWNED_BY_KERN(pna)) {
 		ND("parent busy");
