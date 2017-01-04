@@ -70,7 +70,7 @@ descriptors. Device drivers are completely in the kernel, and the system
 does not rely on IOMMU or other special mechanisms.
 
 
-Installation instructions 
+Installation instructions
 -------------------------
 A single kernel module implements the core NETMAP functions, including
 the VALE switch and access to physical NICS using unmodified device drivers
@@ -95,30 +95,55 @@ FreeBSD has also native netmap support in the Chelsio 10/40G cards.
 
   Linux
   -----
-  On Linux, netmap is an out-of-tree module, so you need to compile it
-  from these sources. The Makefile in the LINUX/ directory will also
-  let you patch device driver sources and build some netmap-enabled
-  device drivers.
-  + make sure you have kernel sources matching your installed kernel
-    (headers only suffice, if you want NETMAP/VALE but no drivers)
+  The ./configure && make build system in the LINUX/
+  directory will let you patch device driver sources and build
+  some netmap-enabled device drivers.
+  Please look at LINUX/README for details.
+
+  + make sure you have kernel headers matching your installed kernel.
+
+  + the sources for e1000e, igb, ixgbe and i40e will be downloaded
+    from the Intel e1000 project on sourceforce.
+
+  + if you need the netmap enabled drivers for e1000, veth, forcedeth,
+    virtio-net or r8169 you will also need the full kernel sources.
+
+  + Configure netmap.
+    To compile NETMAP/VALE and the Intel drivers above: 
+
+	./configure
+
+    (This will also download the Intel driver sources from sourceforce).
+    To compile only NETMAP/VALE (using unmodified drivers):
+
+	./configure --no-drivers # only netmap
+
+    If you need the full kernel sources and you have installed them in
+    /a/b/c/linux-A.B.C/, then you should do
+
+	./configure --kernel-dir=/a/b/c/linux-A.B.C/ # netmap+device drivers
+
+    You can omit --kernel-dir if your kernel sources are in a standard place.
+
+    If you use distribution packages, full sources and headers  may be in
+    different places contain headers (e.g., on debian systems). Use
+
+        ./configure --kernel-sources=/a/b/c/linux-sources-A.B/ \
+		    --kernel-dir=/a/b/c/linux-headers-A.B/
 
   + build kernel modules and sample applications:
-    If kernel sources are in /foo//linux-A.B.C/ , then you should do
 
-	cd netmap/LINUX
-	# build kernel modules
-	make NODRIVERS=1 KSRC=/foo/linux-A.B.C/	# only netmap
-	make KSRC=/a/b/c/linux-A.B.C/		# netmap+device drivers
-	# build sample applications
-	make KSRC=/a/b/c/linux-A.B.C/ apps	# builds sample applications
+	make
 
-    You can omit KSRC if your kernel sources are in a standard place.
+  + (optionally) install the new modules and the applications:
 
-  + if you use distribution packages, source may not contain headers (e.g., on
-    debian systems). Use
+	make install # as root
+   
+    To have the new netmap-enabled driver modules alongside the original
+    ones, you may want to add --driver-suffix=-netmap to the configure
+    command above. The new drivers will then be called e1000e-netmap,
+    ixgbe-netmap and so on.
 
-        make SRC=/a/b/c/linux-sources-A.B/ KSRC=/a/b/c/linux-headers-A.B/
-  
    WINDOWS
    -------
    Netmap has been ported to Windows in summer 2015 by Alessio Faina as part of
@@ -232,7 +257,7 @@ Credits
 NETMAP and VALE are projects of the Universita` di Pisa,
 partially supported by various entities including:
 Intel Research Berkeley, EU FP7 projects CHANGE and OPENLAB,
-Netapp/Silicon Valley Community Foundation, ICSI, 
+Netapp/Silicon Valley Community Foundation, ICSI
 
 Author:		Luigi Rizzo
 Contributors:
@@ -273,3 +298,7 @@ You can find the papers at http://info.iet.unipi.it/~luigi/research.html
 + Stefano Garzarella, Giuseppe Lettieri, Luigi Rizzo,
 	Virtual device passthrough for high speed VM networking
 	IEEE/ACM ANCS 2015, Oakland, May 2015
+
++ Vincenzo Maffione, Luigi Rizzo, Giuseppe Lettieri,
+	Flexible virtual machine networking using netmap passthrough
+	IEEE Lanman 2016, Rome, June 2016

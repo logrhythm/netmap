@@ -1,6 +1,7 @@
 /*
- * Copyright (C) 2011-2014 Matteo Landi, Luigi Rizzo. All rights reserved.
- * Copyright (C) 2013-2014 Universita` di Pisa. All rights reserved.
+ * Copyright (C) 2011-2014 Matteo Landi, Luigi Rizzo
+ * Copyright (C) 2013-2016 Universita` di Pisa
+ * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -48,14 +49,14 @@
 #if defined(CONFIG_NETMAP_GENERIC)
 #define WITH_GENERIC
 #endif
-#if defined(CONFIG_NETMAP_V1000)
-#define WITH_V1000
-#endif
 #if defined(CONFIG_NETMAP_PTNETMAP_GUEST)
 #define WITH_PTNETMAP_GUEST
 #endif
 #if defined(CONFIG_NETMAP_PTNETMAP_HOST)
 #define WITH_PTNETMAP_HOST
+#endif
+#if defined(CONFIG_NETMAP_SINK)
+#define WITH_SINK
 #endif
 
 #elif defined (_WIN32)
@@ -75,6 +76,7 @@
 #endif
 
 #if defined(__FreeBSD__)
+#include <sys/selinfo.h>
 
 #define likely(x)	__builtin_expect((long)!!(x), 1L)
 #define unlikely(x)	__builtin_expect((long)!!(x), 0L)
@@ -92,7 +94,9 @@
 #define	NM_SELINFO_T	struct nm_selinfo
 #define NM_SELRECORD_T	struct thread
 #define	MBUF_LEN(m)	((m)->m_pkthdr.len)
-#define	MBUF_IFP(m)	((m)->m_pkthdr.rcvif)
+#define MBUF_TXQ(m)	((m)->m_pkthdr.flowid)
+#define MBUF_TRANSMIT(na, ifp, m)	((na)->if_transmit(ifp, m))
+#define	GEN_TX_MBUF_IFP(m)	((m)->m_pkthdr.rcvif)
 
 #define NM_ATOMIC_T	volatile int	// XXX ?
 /* atomic operations */
@@ -111,14 +115,14 @@ struct netmap_adapter *netmap_getna(if_t ifp);
 #endif
 
 #if __FreeBSD_version >= 1100027
-#define GET_MBUF_REFCNT(m)      ((m)->m_ext.ext_cnt ? *((m)->m_ext.ext_cnt) : -1)
-#define SET_MBUF_REFCNT(m, x)   *((m)->m_ext.ext_cnt) = x
-#define PNT_MBUF_REFCNT(m)      ((m)->m_ext.ext_cnt)
+#define MBUF_REFCNT(m)		((m)->m_ext.ext_count)
+#define SET_MBUF_REFCNT(m, x)   (m)->m_ext.ext_count = x
 #else
-#define GET_MBUF_REFCNT(m)      ((m)->m_ext.ref_cnt ? *((m)->m_ext.ref_cnt) : -1)
+#define MBUF_REFCNT(m)		((m)->m_ext.ref_cnt ? *((m)->m_ext.ref_cnt) : -1)
 #define SET_MBUF_REFCNT(m, x)   *((m)->m_ext.ref_cnt) = x
-#define PNT_MBUF_REFCNT(m)      ((m)->m_ext.ref_cnt)
 #endif
+
+#define MBUF_QUEUED(m)		1
 
 struct nm_selinfo {
 	struct selinfo si;
@@ -141,7 +145,16 @@ struct hrtimer {
 #define	NM_LOCK_T	safe_spinlock_t	// see bsd_glue.h
 #define	NM_SELINFO_T	wait_queue_head_t
 #define	MBUF_LEN(m)	((m)->len)
-#define	MBUF_IFP(m)	((m)->dev)
+#define MBUF_TRANSMIT(na, ifp, m)							\
+	({										\
+		/* Avoid infinite recursion with generic. */				\
+		m->priority = NM_MAGIC_PRIORITY_TX;					\
+		(((struct net_device_ops *)(na)->if_transmit)->ndo_start_xmit(m, ifp));	\
+		0;									\
+	})
+
+/* See explanation in nm_os_generic_xmit_frame. */
+#define	GEN_TX_MBUF_IFP(m)	((struct ifnet *)skb_shinfo(m)->destructor_arg)
 
 #define NM_ATOMIC_T	volatile long unsigned int
 
@@ -257,6 +270,10 @@ struct nm_bdg_fwd;
 struct nm_bridge;
 struct netmap_priv_d;
 
+/* os-specific NM_SELINFO_T initialzation/destruction functions */
+void nm_os_selinfo_init(NM_SELINFO_T *);
+void nm_os_selinfo_uninit(NM_SELINFO_T *);
+
 const char *nm_dump_buf(char *p, int len, int lim, char *dst);
 
 void nm_os_selwakeup(NM_SELINFO_T *si);
@@ -267,7 +284,16 @@ void nm_os_ifnet_fini(void);
 void nm_os_ifnet_lock(void);
 void nm_os_ifnet_unlock(void);
 
+void nm_os_get_module(void);
+void nm_os_put_module(void);
+
 void netmap_make_zombie(struct ifnet *);
+void netmap_undo_zombie(struct ifnet *);
+
+/* os independent alloc/realloc/free */
+void *nm_os_malloc(size_t);
+void *nm_os_realloc(void *, size_t new_size, size_t old_size);
+void nm_os_free(void *);
 
 /* passes a packet up to the host stack.
  * If the packet is sent (or dropped) immediately it returns NULL,
@@ -276,6 +302,8 @@ void netmap_make_zombie(struct ifnet *);
  * the entire chain to the host stack.
  */
 void *nm_os_send_up(struct ifnet *, struct mbuf *m, struct mbuf *prev);
+
+int nm_os_mbuf_has_offld(struct mbuf *m);
 
 #include "netmap_mbq.h"
 
@@ -297,6 +325,12 @@ nm_txrx_swap(enum txrx t)
 
 #define for_rx_tx(t)	for ((t) = 0; (t) < NR_TXRX; (t)++)
 
+#ifdef WITH_MONITOR
+struct netmap_zmon_list {
+	struct netmap_kring *next;
+	struct netmap_kring *prev;
+};
+#endif /* WITH_MONITOR */
 
 /*
  * private, kernel view of a ring. Keeps track of the status of
@@ -376,6 +410,16 @@ struct netmap_kring {
 #define NKR_FORWARD	0x4		/* (host ring only) there are
 					   packets to forward
 					 */
+#define NKR_NEEDRING	0x8		/* ring needed even if users==0
+					 * (used internally by pipes and
+					 *  by ptnetmap host ports)
+					 */
+
+	uint32_t	nr_mode;
+	uint32_t	nr_pending_mode;
+#define NKR_NETMAP_OFF	0x0
+#define NKR_NETMAP_ON	0x1
+
 	uint32_t	nkr_num_slots;
 
 	/*
@@ -421,13 +465,14 @@ struct netmap_kring {
 	 * store incoming mbufs in a queue that is drained by
 	 * a rxsync.
 	 */
-	struct mbuf **tx_pool;
-	// u_int nr_ntc;		/* Emulation of a next-to-clean RX ring pointer. */
-	struct mbq rx_queue;            /* intercepted rx mbufs. */
+	struct mbuf	**tx_pool;
+	struct mbuf	*tx_event;	/* TX event used as a notification */
+	NM_LOCK_T	tx_event_lock;	/* protects the tx_event mbuf */
+	struct mbq	rx_queue;       /* intercepted rx mbufs. */
 
 	uint32_t	users;		/* existing bindings for this ring */
 
-	uint32_t	ring_id;	/* debugging */
+	uint32_t	ring_id;	/* kring identifier */
 	enum txrx	tx;		/* kind of ring (tx or rx) */
 	char name[64];			/* diagnostic */
 
@@ -449,9 +494,6 @@ struct netmap_kring {
 	struct netmap_kring *pipe;	/* if this is a pipe ring,
 					 * pointer to the other end
 					 */
-	struct netmap_ring *save_ring;	/* pointer to hidden rings
-       					 * (see netmap_pipe.c for details)
-					 */
 #endif /* WITH_PIPES */
 
 #ifdef WITH_VALE
@@ -463,6 +505,12 @@ struct netmap_kring {
 	struct netmap_kring **monitors;
 	uint32_t max_monitors; /* current size of the monitors array */
 	uint32_t n_monitors;	/* next unused entry in the monitor array */
+	uint32_t mon_pos[NR_TXRX]; /* index of this ring in the monitored ring array */
+	uint32_t mon_tail;  /* last seen slot on rx */
+
+	/* circular list of zero-copy monitors */
+	struct netmap_zmon_list zmon_list[NR_TXRX];
+
 	/*
 	 * Monitors work by intercepting the sync and notify callbacks of the
 	 * monitored krings. This is implemented by replacing the pointers
@@ -471,8 +519,6 @@ struct netmap_kring {
 	int (*mon_sync)(struct netmap_kring *kring, int flags);
 	int (*mon_notify)(struct netmap_kring *kring, int flags);
 
-	uint32_t mon_tail;  /* last seen slot on rx */
-	uint32_t mon_pos;   /* index of this ring in the monitored ring array */
 #endif
 }
 #ifdef _WIN32
@@ -481,6 +527,21 @@ __declspec(align(64));
 __attribute__((__aligned__(64)));
 #endif
 
+/* return 1 iff the kring needs to be turned on */
+static inline int
+nm_kring_pending_on(struct netmap_kring *kring)
+{
+	return kring->nr_pending_mode == NKR_NETMAP_ON &&
+	       kring->nr_mode == NKR_NETMAP_OFF;
+}
+
+/* return 1 iff the kring needs to be turned off */
+static inline int
+nm_kring_pending_off(struct netmap_kring *kring)
+{
+	return kring->nr_pending_mode == NKR_NETMAP_OFF &&
+	       kring->nr_mode == NKR_NETMAP_ON;
+}
 
 /* return the next index, with wraparound */
 static inline uint32_t
@@ -676,6 +737,9 @@ struct netmap_adapter {
 	 *	For hw devices this is typically a selwakeup(),
 	 *	but for NIC/host ports attached to a switch (or vice-versa)
 	 *	we also need to invoke the 'txsync' code downstream.
+	 *      This callback pointer is actually used only to initialize
+	 *      kring->nm_notify.
+	 *      Return values are the same as for netmap_rx_irq().
 	 */
 	void (*nm_dtor)(struct netmap_adapter *);
 
@@ -725,7 +789,7 @@ struct netmap_adapter {
 
 	/* memory allocator (opaque)
 	 * We also cache a pointer to the lut_entry for translating
-	 * buffer addresses, and the total number of buffers.
+	 * buffer addresses, the total number of buffers and the buffer size.
 	 */
  	struct netmap_mem_d *nm_mem;
 	struct netmap_lut na_lut;
@@ -740,6 +804,9 @@ struct netmap_adapter {
 	struct netmap_pipe_adapter **na_pipes;
 	int na_next_pipe;	/* next free slot in the array */
 	int na_max_pipes;	/* size of the array */
+
+	/* Offset of ethernet header for each packet. */
+	u_int virt_hdr_len;
 
 	char name[64];
 };
@@ -805,9 +872,8 @@ struct netmap_vp_adapter {	/* VALE software port */
 	int bdg_port;
 	struct nm_bridge *na_bdg;
 	int retry;
+	int autodelete; /* remove the ifp on last reference */
 
-	/* Offset of ethernet header for each packet. */
-	u_int virt_hdr_len;
 	/* Maximum Frame Size, used in bdg_mismatch_datapath() */
 	u_int mfs;
 	/* Last source MAC on this port */
@@ -855,6 +921,10 @@ struct netmap_generic_adapter {	/* emulated device */
 	/* Is the adapter able to use multiple RX slots to scatter
 	 * each packet pushed up by the driver? */
 	int rxsg;
+
+	/* Is the transmission path controlled by a netmap-aware
+	 * device queue (i.e. qdisc on linux)? */
+	int txqdisc;
 };
 #endif  /* WITH_GENERIC */
 
@@ -926,7 +996,10 @@ struct netmap_bwrap_adapter {
 	struct nm_bdg_polling_state *na_polling_state;
 };
 int netmap_bwrap_attach(const char *name, struct netmap_adapter *);
+int netmap_vi_create(struct nmreq *, int);
 
+#else /* !WITH_VALE */
+#define netmap_vi_create(nmr, a) (EOPNOTSUPP)
 #endif /* WITH_VALE */
 
 #ifdef WITH_PIPES
@@ -965,13 +1038,16 @@ nm_kr_rxspace(struct netmap_kring *k)
 #define nm_kr_txspace(_k) nm_kr_rxspace(_k)
 
 
-/* True if no space in the tx ring. only valid after txsync_prologue */
+/* True if no space in the tx ring, only valid after txsync_prologue */
 static inline int
 nm_kr_txempty(struct netmap_kring *kring)
 {
 	return kring->rcur == kring->nr_hwtail;
 }
 
+/* True if no more completed slots in the rx ring, only valid after
+ * rxsync_prologue */
+#define nm_kr_rxempty(_k)	nm_kr_txempty(_k)
 
 /*
  * protect against multiple threads using the same ring.
@@ -1101,10 +1177,26 @@ struct netmap_slot *netmap_reset(struct netmap_adapter *na,
 	enum txrx tx, u_int n, u_int new_cur);
 int netmap_ring_reinit(struct netmap_kring *);
 
+/* Return codes for netmap_*x_irq. */
+enum {
+	/* Driver should do normal interrupt processing, e.g. because
+	 * the interface is not in netmap mode. */
+	NM_IRQ_PASS = 0,
+	/* Port is in netmap mode, and the interrupt work has been
+	 * completed. The driver does not have to notify netmap
+	 * again before the next interrupt. */
+	NM_IRQ_COMPLETED = -1,
+	/* Port is in netmap mode, but the interrupt work has not been
+	 * completed. The driver has to make sure netmap will be
+	 * notified again soon, even if no more interrupts come (e.g.
+	 * on Linux the driver should not call napi_complete()). */
+	NM_IRQ_RESCHED = -2,
+};
+
 /* default functions to handle rx/tx interrupts */
 int netmap_rx_irq(struct ifnet *, u_int, u_int *);
 #define netmap_tx_irq(_n, _q) netmap_rx_irq(_n, _q, NULL)
-void netmap_common_irq(struct ifnet *, u_int, u_int *work_done);
+int netmap_common_irq(struct netmap_adapter *, u_int, u_int *work_done);
 
 
 #ifdef WITH_VALE
@@ -1140,11 +1232,27 @@ nm_iszombie(struct netmap_adapter *na)
 	return na == NULL || (na->na_flags & NAF_ZOMBIE);
 }
 
+static inline void
+nm_update_hostrings_mode(struct netmap_adapter *na)
+{
+	/* Process nr_mode and nr_pending_mode for host rings. */
+	na->tx_rings[na->num_tx_rings].nr_mode =
+		na->tx_rings[na->num_tx_rings].nr_pending_mode;
+	na->rx_rings[na->num_rx_rings].nr_mode =
+		na->rx_rings[na->num_rx_rings].nr_pending_mode;
+}
+
 /* set/clear native flags and if_transmit/netdev_ops */
 static inline void
 nm_set_native_flags(struct netmap_adapter *na)
 {
 	struct ifnet *ifp = na->ifp;
+
+	/* We do the setup for intercepting packets only if we are the
+	 * first user of this adapapter. */
+	if (na->active_fds > 0) {
+		return;
+	}
 
 	na->na_flags |= NAF_NETMAP_ON;
 #ifdef IFCAP_NETMAP /* or FreeBSD ? */
@@ -1164,13 +1272,21 @@ nm_set_native_flags(struct netmap_adapter *na)
 	((struct netmap_hw_adapter *)na)->save_ethtool = ifp->ethtool_ops;
 	ifp->ethtool_ops = &((struct netmap_hw_adapter*)na)->nm_eto;
 #endif
+	nm_update_hostrings_mode(na);
 }
-
 
 static inline void
 nm_clear_native_flags(struct netmap_adapter *na)
 {
 	struct ifnet *ifp = na->ifp;
+
+	/* We undo the setup for intercepting packets only if we are the
+	 * last user of this adapapter. */
+	if (na->active_fds > 0) {
+		return;
+	}
+
+	nm_update_hostrings_mode(na);
 
 #if defined(__FreeBSD__)
 	ifp->if_transmit = na->if_transmit;
@@ -1265,6 +1381,9 @@ int netmap_krings_create(struct netmap_adapter *na, u_int tailroom);
  */
 void netmap_krings_delete(struct netmap_adapter *na);
 
+int netmap_hw_krings_create(struct netmap_adapter *na);
+void netmap_hw_krings_delete(struct netmap_adapter *na);
+
 /* set the stopped/enabled status of ring
  * When stopping, they also wait for all current activity on the ring to
  * terminate. The status change is then notified using the na nm_notify
@@ -1279,7 +1398,7 @@ void netmap_enable_all_rings(struct ifnet *);
 
 int netmap_do_regif(struct netmap_priv_d *priv, struct netmap_adapter *na,
 	uint16_t ringid, uint32_t flags);
-
+void netmap_do_unregif(struct netmap_priv_d *priv);
 
 u_int nm_bound_var(u_int *v, u_int dflt, u_int lo, u_int hi, const char *msg);
 int netmap_get_na(struct nmreq *nmr, struct netmap_adapter **na,
@@ -1311,11 +1430,10 @@ struct netmap_bdg_ops {
 u_int netmap_bdg_learning(struct nm_bdg_fwd *ft, uint8_t *dst_ring,
 		struct netmap_vp_adapter *);
 
+#define	NM_BRIDGES		8	/* number of bridges */
 #define	NM_BDG_MAXPORTS		254	/* up to 254 */
 #define	NM_BDG_BROADCAST	NM_BDG_MAXPORTS
 #define	NM_BDG_NOPORT		(NM_BDG_MAXPORTS+1)
-
-#define	NM_NAME			"vale"	/* prefix for bridge port name */
 
 /* these are redefined in case of no VALE support */
 int netmap_get_bdg_na(struct nmreq *nmr, struct netmap_adapter **na, int create);
@@ -1414,11 +1532,11 @@ int netmap_adapter_put(struct netmap_adapter *na);
 /*
  * module variables
  */
-#define NETMAP_BUF_BASE(na)	((na)->na_lut.lut[0].vaddr)
-#define NETMAP_BUF_SIZE(na)	((na)->na_lut.objsize)
-extern int netmap_mitigate;	// XXX not really used
+#define NETMAP_BUF_BASE(_na)	((_na)->na_lut.lut[0].vaddr)
+#define NETMAP_BUF_SIZE(_na)	((_na)->na_lut.objsize)
 extern int netmap_no_pendintr;
-extern int netmap_verbose;	// XXX debugging
+extern int netmap_mitigate;
+extern int netmap_verbose;		/* for debugging */
 enum {                                  /* verbose flags */
 	NM_VERB_ON = 1,                 /* generic verbose */
 	NM_VERB_HOST = 0x2,             /* verbose host stack */
@@ -1431,12 +1549,11 @@ enum {                                  /* verbose flags */
 };
 
 extern int netmap_txsync_retry;
-extern int netmap_adaptive_io;
 extern int netmap_flags;
 extern int netmap_generic_mit;
 extern int netmap_generic_ringsize;
 extern int netmap_generic_rings;
-extern int netmap_use_count;
+extern int netmap_generic_txqdisc;
 
 /*
  * NA returns a pointer to the struct netmap adapter from the ifp,
@@ -1521,8 +1638,8 @@ netmap_load_map(struct netmap_adapter *na,
 	bus_dma_tag_t tag, bus_dmamap_t map, void *buf)
 {
 	if (0 && map) {
-		*map = dma_map_single(na->pdev, buf, na->na_lut.objsize,
-				DMA_BIDIRECTIONAL);
+		*map = dma_map_single(na->pdev, buf, NETMAP_BUF_SIZE(na),
+				      DMA_BIDIRECTIONAL);
 	}
 }
 
@@ -1530,11 +1647,11 @@ static inline void
 netmap_unload_map(struct netmap_adapter *na,
 	bus_dma_tag_t tag, bus_dmamap_t map)
 {
-	u_int sz = na->na_lut.objsize;
+	u_int sz = NETMAP_BUF_SIZE(na);
 
 	if (*map) {
 		dma_unmap_single(na->pdev, *map, sz,
-				DMA_BIDIRECTIONAL);
+				 DMA_BIDIRECTIONAL);
 	}
 }
 
@@ -1542,7 +1659,7 @@ static inline void
 netmap_reload_map(struct netmap_adapter *na,
 	bus_dma_tag_t tag, bus_dmamap_t map, void *buf)
 {
-	u_int sz = na->na_lut.objsize;
+	u_int sz = NETMAP_BUF_SIZE(na);
 
 	if (*map) {
 		dma_unmap_single(na->pdev, *map, sz,
@@ -1700,6 +1817,28 @@ struct netmap_priv_d {
 struct netmap_priv_d *netmap_priv_new(void);
 void netmap_priv_delete(struct netmap_priv_d *);
 
+static inline int nm_kring_pending(struct netmap_priv_d *np)
+{
+	struct netmap_adapter *na = np->np_na;
+	enum txrx t;
+	int i;
+
+	for_rx_tx(t) {
+		for (i = np->np_qfirst[t]; i < np->np_qlast[t]; i++) {
+			struct netmap_kring *kring = &NMR(na, t)[i];
+			if (kring->nr_mode != kring->nr_pending_mode) {
+				return 1;
+			}
+		}
+	}
+	return 0;
+}
+
+#ifdef WITH_PIPES
+int netmap_pipe_txsync(struct netmap_kring *txkring, int flags);
+int netmap_pipe_rxsync(struct netmap_kring *rxkring, int flags);
+#endif /* WITH_PIPES */
+
 #ifdef WITH_MONITOR
 
 struct netmap_monitor_adapter {
@@ -1718,11 +1857,10 @@ struct netmap_monitor_adapter {
  * native netmap support.
  */
 int generic_netmap_attach(struct ifnet *ifp);
-void generic_rx_handler(struct ifnet *ifp, struct mbuf *m);;
+int generic_rx_handler(struct ifnet *ifp, struct mbuf *m);;
 
-int nm_os_catch_rx(struct netmap_generic_adapter *na, int intercept);
-/* XXX why the type/argument name disparity with netmap_catch_rx ? */
-void nm_os_catch_tx(struct netmap_generic_adapter *na, int enable);
+int nm_os_catch_rx(struct netmap_generic_adapter *gna, int intercept);
+int nm_os_catch_tx(struct netmap_generic_adapter *gna, int intercept);
 
 /*
  * the generic transmit routine is passed a structure to optionally
@@ -1741,11 +1879,13 @@ struct nm_os_gen_arg {
 	void *addr;	/* payload of current packet */
 	u_int len;	/* packet length */
 	u_int ring_nr;	/* packet length */
+	u_int qevent;   /* in txqdisc mode, place an event on this mbuf */
 };
+
 int nm_os_generic_xmit_frame(struct nm_os_gen_arg *);
 int nm_os_generic_find_num_desc(struct ifnet *ifp, u_int *tx, u_int *rx);
 void nm_os_generic_find_num_queues(struct ifnet *ifp, u_int *txq, u_int *rxq);
-int nm_os_generic_rxsg_supported(void);
+void nm_os_generic_set_features(struct netmap_generic_adapter *gna);
 
 static inline struct ifnet*
 netmap_generic_getifp(struct netmap_generic_adapter *gna)
@@ -1755,6 +1895,8 @@ netmap_generic_getifp(struct netmap_generic_adapter *gna)
 
         return gna->up.up.ifp;
 }
+
+void netmap_generic_irq(struct netmap_adapter *na, u_int q, u_int *work_done);
 
 //#define RATE_GENERIC  /* Enables communication statistics for generic. */
 #ifdef RATE_GENERIC
@@ -1893,14 +2035,15 @@ typedef void (*nm_kthread_worker_fn_t)(void *data);
 
 /* kthread configuration */
 struct nm_kthread_cfg {
-	long				type;		/* kthread type */
-	struct nm_kth_event_cfg		event;		/* event/ioctl fd */
+	long				type;		/* kthread type/identifier */
 	nm_kthread_worker_fn_t		worker_fn;	/* worker function */
 	void				*worker_private;/* worker parameter */
 	int				attach_user;	/* attach kthread to user process */
 };
 /* kthread configuration */
-struct nm_kthread *nm_os_kthread_create(struct nm_kthread_cfg *cfg);
+struct nm_kthread *nm_os_kthread_create(struct nm_kthread_cfg *cfg,
+					unsigned int cfgtype,
+					void *opaque);
 int nm_os_kthread_start(struct nm_kthread *);
 void nm_os_kthread_stop(struct nm_kthread *);
 void nm_os_kthread_delete(struct nm_kthread *);
@@ -1918,8 +2061,7 @@ struct netmap_pt_host_adapter {
 
 	struct netmap_adapter *parent;
 	int (*parent_nm_notify)(struct netmap_kring *kring, int flags);
-
-	void *ptn_state;
+	void *ptns;
 };
 /* ptnetmap HOST routines */
 int netmap_get_pt_host_na(struct nmreq *nmr, struct netmap_adapter **na, int create);
@@ -1934,26 +2076,42 @@ nm_ptnetmap_host_on(struct netmap_adapter *na)
 	((nmr)->nr_flags & (NR_PTNETMAP_HOST) ? EOPNOTSUPP : 0)
 #define ptnetmap_ctl(_1, _2)   EINVAL
 #define nm_ptnetmap_host_on(_1)   EINVAL
-#endif /* WITH_PTNETMAP_HOST */
+#endif /* !WITH_PTNETMAP_HOST */
 
 #ifdef WITH_PTNETMAP_GUEST
 /* ptnetmap GUEST routines */
-struct netmap_pt_guest_ops {
-	uint32_t (*nm_ptctl)(struct ifnet *, uint32_t);
-};
+
 /*
  * netmap adapter for guest ptnetmap ports
  */
 struct netmap_pt_guest_adapter {
+        /* The netmap adapter to be used by netmap applications.
+	 * This field must be the first, to allow upcast. */
 	struct netmap_hw_adapter hwup;
 
-	struct netmap_pt_guest_ops *pv_ops;
-	struct paravirt_csb *csb;
+        /* The netmap adapter to be used by the driver. */
+        struct netmap_hw_adapter dr;
+
+	void *csb;
+
+	/* Reference counter to track users of backend netmap port: the
+	 * network stack and netmap clients.
+	 * Used to decide when we need (de)allocate krings/rings and
+	 * start (stop) ptnetmap kthreads. */
+	int backend_regifs;
+
 };
 
-int netmap_pt_guest_attach(struct netmap_adapter *, struct netmap_pt_guest_ops *);
-int netmap_pt_guest_txsync(struct netmap_kring *kring, int flags, int *notify);
-int netmap_pt_guest_rxsync(struct netmap_kring *kring, int flags, int *notify);
+int netmap_pt_guest_attach(struct netmap_adapter *na, void *csb,
+			   unsigned int nifp_offset, unsigned int memid);
+struct ptnet_ring;
+bool netmap_pt_guest_txsync(struct ptnet_ring *ptring, struct netmap_kring *kring,
+			    int flags);
+bool netmap_pt_guest_rxsync(struct ptnet_ring *ptring, struct netmap_kring *kring,
+			    int flags);
+int ptnet_nm_krings_create(struct netmap_adapter *na);
+void ptnet_nm_krings_delete(struct netmap_adapter *na);
+void ptnet_nm_dtor(struct netmap_adapter *na);
 #endif /* WITH_PTNETMAP_GUEST */
 
 #endif /* _NET_NETMAP_KERN_H_ */

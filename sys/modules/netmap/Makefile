@@ -8,7 +8,7 @@
 
 .PATH: ${.CURDIR}/../../dev/netmap
 .PATH.h: ${.CURDIR}/../../net
-CFLAGS += -I${.CURDIR}/../../
+CFLAGS += -I${.CURDIR}/../../ -D INET
 KMOD	= netmap
 SRCS	= device_if.h bus_if.h pci_if.h opt_netmap.h
 SRCS	+= netmap.c netmap.h netmap_kern.h
@@ -20,7 +20,8 @@ SRCS	+= netmap_freebsd.c
 SRCS	+= netmap_offloadings.c
 SRCS	+= netmap_pipe.c
 SRCS	+= netmap_monitor.c
-SRCS	+= ptnetmap.c
+SRCS	+= netmap_pt.c
+SRCS	+= if_ptnet.c
 SRCS	+= opt_inet.h opt_inet6.h
 
 .include <bsd.kmod.mk>

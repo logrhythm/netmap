@@ -1,6 +1,18 @@
 	EXPERIMENTING WITH NETMAP, VALE AND FAST QEMU
 	---------------------------------------------
 
+***** DISCLAIMER *****
+2016-12-20
+The bootable images referenced here are still available, but they contain
+a very old version of the netmap software. As a result, also the
+instructions here are outdated, as they refer to the old images.
+In particular, the e1000-paravirt solution has been deprecated and
+replaced by a solution based on the netmap passthrough.
+New images with updated software are being produced and will be published
+soon.
+
+***** END OF DIS *****
+
 To ease experiments with Netmap, the VALE switch and our Qemu enhancements
 we have prepared a couple of bootable images (linux and FreeBSD).
 You can find them on the netmap page
@@ -13,7 +25,7 @@ Below are step-by-step instructions on experiments you can run
 with these images. The two main versions are
 
 	picobsd.hdd	-> FreeBSD HEAD (netmap + VALE)
-	tinycore.hdd	-> Linux (qemu + netmap + VALE)      
+	tinycore.hdd	-> Linux (qemu + netmap + VALE)
 
 Booting the image
 -----------------
@@ -59,7 +71,7 @@ Linux image:
     + "Boot Core (command line only)"
       boots in console mode with virtual terminals.
       You're automatically logged in as user 'tc'.
-      To log in the other terminals use the same username 
+      To log in the other terminals use the same username
       (no password required).
 
   + The system should automatically recognize the existing ethernet

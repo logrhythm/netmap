@@ -29,8 +29,8 @@
  * character device drivers and network code/device drivers.
  */
 
-#ifndef _BSD_GLUE_H
-#define _BSD_GLUE_H
+#ifndef NETMAP_BSD_GLUE_H
+#define NETMAP_BSD_GLUE_H
 
 /* a set of headers used in netmap */
 #include <linux/version.h>
@@ -63,6 +63,10 @@
 
 /*----- support for compiling on older versions of linux -----*/
 #include "netmap_linux_config.h"
+
+#ifdef NETMAP_LINUX_HAVE_PAGE_REF
+#include <linux/page_ref.h>
+#endif /* NETMAP_LINUX_HAVE_PAGE_REF */
 
 #ifndef NETMAP_LINUX_HAVE_HRTIMER_MODE_REL
 #define HRTIMER_MODE_REL	HRTIMER_REL
@@ -120,18 +124,54 @@ struct net_device_ops {
 #define usleep_range(a, b)	msleep((a)+(b)+999)
 #endif
 
+#ifdef NETMAP_LINUX_HAVE_PAGE_REF
+#define NM_SET_PAGE_COUNT(page, v)	set_page_count(page, v)
+#else
+#define NM_SET_PAGE_COUNT(page, v)	atomic_set(&((page)->NETMAP_LINUX_PAGE_COUNT), (v))
+#endif
+
 #ifndef NETMAP_LINUX_HAVE_SPLIT_PAGE
 #define split_page(page, order) 			  \
 	do {						  \
 		int i_;					  \
 		for (i_ = 1; i_ < (1 << (order)); i_++)	  \
-			atomic_set(&(page)[i_]._count, 1);\
+			NM_SET_PAGE_COUNT(&(page)[i_], 1);\
 	} while (0)
 #endif /* HAVE_SPLIT_PAGE */
 
 #ifndef NETMAP_LINUX_HAVE_NNITD
 #define netdev_notifier_info_to_dev(ptr)	(ptr)
 #endif /* HAVE_NNITD */
+
+#ifndef NETMAP_LINUX_HAVE_SKB_FRAG_SIZE
+static inline unsigned int skb_frag_size(const skb_frag_t *frag) {
+	return frag->size;
+}
+#endif
+#ifndef NETMAP_LINUX_HAVE_SKB_FRAG_ADDRESS
+static inline void *skb_frag_address(const skb_frag_t *frag) {
+	return page_address(frag->page) + frag->page_offset;
+}
+#endif
+#ifndef NETMAP_LINUX_HAVE_SKB_CHECKSUM_START_OFFSET
+static inline int skb_checksum_start_offset(const struct sk_buff *skb) {
+	return skb->csum_start - skb_headroom(skb);
+}
+#endif
+
+#ifdef NETMAP_LINUX_HAVE_NUM_RX_QUEUES
+#define DEV_NUM_RX_QUEUES(_netdev) (_netdev)->num_rx_queues
+#else
+#define	DEV_NUM_RX_QUEUES(_netdev) 1
+#endif
+
+#ifdef NETMAP_LINUX_HAVE_REG_NOTIF_RH
+#define NM_REG_NETDEV_NOTIF(nb)		register_netdevice_notifier_rh(nb)
+#define NM_UNREG_NETDEV_NOTIF(nb)	unregister_netdevice_notifier_rh(nb)
+#else
+#define NM_REG_NETDEV_NOTIF(nb)		register_netdevice_notifier(nb)
+#define NM_UNREG_NETDEV_NOTIF(nb)	unregister_netdevice_notifier(nb)
+#endif /* NETMAP_LINUX_HAVE_REG_NOTIF_RH */
 
 /*----------- end of LINUX_VERSION_CODE dependencies ----------*/
 
@@ -190,8 +230,7 @@ struct thread;
 #define	m_nextpkt		next			// chain of mbufs
 #define m_freem(m)		dev_kfree_skb_any(m)	// free a sk_buff
 
-#define GET_MBUF_REFCNT(m)	NM_ATOMIC_READ(&((m)->users))
-#define nm_os_get_mbuf(ifp, size)	alloc_skb(size, GFP_ATOMIC)
+#define MBUF_REFCNT(m)			NM_ATOMIC_READ(&((m)->users))
 /*
  * on tx we force skb->queue_mapping = ring_nr,
  * but on rx it is the driver that sets the value,
@@ -199,13 +238,17 @@ struct thread;
  */
 #define MBUF_TXQ(m)		skb_get_queue_mapping(m)
 #define MBUF_RXQ(m)		(skb_rx_queue_recorded(m) ? skb_get_rx_queue(m) : 0)
-#define SET_MBUF_DESTRUCTOR(m, f) m->destructor = (void *)&f
+#define SET_MBUF_DESTRUCTOR(m, f) m->destructor = (void *)f
 
 /* Magic number for sk_buff.priority field, used to take decisions in
- * generic_ndo_start_xmit() and in linux_generic_rx_handler().
+ * generic_ndo_start_xmit(), linux_generic_rx_handler() and
+ * generic_qdisc_dequeue().
  */
-#define NM_MAGIC_PRIORITY_TX 0xad86d310U
-#define NM_MAGIC_PRIORITY_RX 0xad86d311U
+#define NM_MAGIC_PRIORITY_TX	0xad86d310U
+#define NM_MAGIC_PRIORITY_TXQE	0xad86d311U
+#define NM_MAGIC_PRIORITY_RX	0xad86d30fU
+
+#define MBUF_QUEUED(m)		((m->priority & (~0x1)) == NM_MAGIC_PRIORITY_TX)
 
 /*
  * m_copydata() copies from mbuf to buffer following the mbuf chain.
@@ -215,6 +258,7 @@ struct thread;
 #define m_copydata(m, o, l, b)          skb_copy_bits(m, o, b, l)
 
 #define copyin(_from, _to, _len)	copy_from_user(_to, _from, _len)
+#define copyout(_from, _to, _len)	copy_to_user(_to, _from, _len)
 
 /*
  * struct ifnet is remapped into struct net_device on linux.
@@ -295,19 +339,6 @@ static inline void mtx_unlock(safe_spinlock_t *m)
 #define BDG_RTRYLOCK(b)		down_read_trylock(&(b)->bdg_lock)
 #define BDG_SET_VAR(lval, p)	((lval) = (p))
 #define BDG_GET_VAR(lval)	(lval)
-#define BDG_FREE(p)		kfree(p)
-
-/*
- * in the malloc/free code we ignore the type
- */
-/* use volatile to fix a probable compiler error on 2.6.25 */
-#define malloc(_size, type, flags)                      \
-        ({ volatile int _v = _size; kmalloc(_v, GFP_ATOMIC | __GFP_ZERO); })
-
-#define realloc(addr, _size, type, flags)		\
-	({ volatile int _v = _size; krealloc(addr, _v, GFP_ATOMIC | __GFP_ZERO); })
-
-#define free(a, t)	kfree(a)
 
 // XXX do we need GPF_ZERO ?
 // XXX do we need GFP_DMA for slots ?
@@ -332,7 +363,7 @@ static inline int ilog2(uint64_t n)
 	if (p_ != NULL) 					\
 		split_page(p_, order_);				\
 	(p_ != NULL ? (char*)page_address(p_) : NULL); })
-	
+
 #define contigfree(va, sz, ty)					\
 	do {							\
 		unsigned int npages_ =				\
@@ -445,7 +476,7 @@ int sysctl_handle_long(SYSCTL_HANDLER_ARGS);
 #define MALLOC_DEFINE(a, b, c)
 
 struct netmap_adapter;
-int netmap_linux_config(struct netmap_adapter *na, 
+int netmap_linux_config(struct netmap_adapter *na,
 		u_int *txr, u_int *rxr, u_int *txd, u_int *rxd);
 /* ---- namespaces ------ */
 #ifdef CONFIG_NET_NS
@@ -460,4 +491,4 @@ void netmap_bns_unregister(void);
 
 #define if_printf(ifp, fmt, ...)  dev_info(&(ifp)->dev, fmt, ##__VA_ARGS__)
 
-#endif /* _BSD_GLUE_H */
+#endif /* NETMAP_BSD_GLUE_H */
