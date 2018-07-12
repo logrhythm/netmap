@@ -173,12 +173,6 @@ virtio_netmap_init_sgs(struct virtnet_info *vi)
 #endif /* VIRTIO_NOTIFY */
 
 
-struct netmap_virtio_adapter {
-	struct netmap_hw_adapter hwna; /* base class */
-	struct virtio_net_hdr_mrg_rxbuf shared_rxvhdr ____cacheline_aligned_in_smp;
-	struct virtio_net_hdr_mrg_rxbuf shared_txvhdr ____cacheline_aligned_in_smp;
-};
-
 static void
 virtio_netmap_clean_used_rings(struct virtnet_info *vi,
 			       struct netmap_adapter *na)
@@ -254,120 +248,95 @@ virtio_netmap_reclaim_unused(struct virtnet_info *vi)
 	}
 }
 
+/* Set or clear nr_pending_mode and nr_mode for all the rings, independently
+ * of the specific user request. This is necessary for now because the
+ * virtio-net driver patches do not support single-queue mode (modifications
+ * would be needed to free_unused_bufs() free_receive_bufs()).*/
+static void
+virtio_netmap_set_kring_mode(struct netmap_adapter *na, int mode)
+{
+	int i;
+
+	for (i = 0; i < DEV_NUM_TX_QUEUES(na->ifp); i++) {
+		struct netmap_kring *kring = &na->tx_rings[i];
+
+		kring->nr_pending_mode = kring->nr_mode = mode;
+	}
+
+	for (i = 0; i < DEV_NUM_RX_QUEUES(na->ifp); i++) {
+		struct netmap_kring *kring = &na->rx_rings[i];
+
+		kring->nr_pending_mode = kring->nr_mode = mode;
+	}
+
+}
+
 /* Register and unregister. */
 static int
 virtio_netmap_reg(struct netmap_adapter *na, int onoff)
 {
-	struct netmap_virtio_adapter *vna = (struct netmap_virtio_adapter *)na;
 	struct ifnet *ifp = na->ifp;
 	struct virtnet_info *vi = netdev_priv(ifp);
-	int hwrings_pending = 0, hwrings;
 	bool was_up = false;
 	int error = 0;
-	enum txrx t;
-	int i;
 
-	/* These virtio-net driver patches do not support single-queue mode
-	 * (modifications would be needed to free_unused_bufs()
-	 * free_receive_bufs()). As a result, we fail here if we detect
-	 * the user is trying to open or close only a subset of the rings. */
-	hwrings = nma_get_nrings(na, NR_TX) + nma_get_nrings(na, NR_RX);
-	for_rx_tx(t) {
-		for (i = 0; i < nma_get_nrings(na, t); i++) {
-			struct netmap_kring *kring = NMR(na, t)[i];
-
-			if ((onoff && nm_kring_pending_on(kring)) ||
-				(!onoff && nm_kring_pending_off(kring))) {
-				hwrings_pending ++;
-			}
-		}
-	}
-
-	if (!(hwrings_pending == 0 || hwrings_pending == hwrings)) {
-		D("virtio-net native adapter can only open "
-		  "all RX and TX hw rings");
+	if (na == NULL)
 		return EINVAL;
+
+	if (na->active_fds > 0) {
+		/* virtio-net adapter currently does not support single-queue
+		 * mode. As a consequence, register (unregister) operations
+		 * only have effect with first (last) user.*/
+		return 0;
 	}
 
 	/* It's important to make sure each virtnet_close() matches
 	 * a virtnet_open(), otherwise a napi_disable() is not matched by
 	 * a napi_enable(), which results in a deadlock. */
-	if (hwrings_pending && netif_running(ifp)) {
+	if (netif_running(ifp)) {
 		was_up = true;
 		/* Down the interface. This also disables napi. */
 		virtnet_close(ifp);
 	}
 
 	if (onoff) {
-		if (hwrings_pending) {
-			/* TX shared virtio-net header must be zeroed because its
-			 * content is exposed to the host. RX shared virtio-net
-			 * header is zeroed only for security reasons. */
-			memset(&vna->shared_txvhdr, 0, sizeof(vna->shared_txvhdr));
-			memset(&vna->shared_rxvhdr, 0, sizeof(vna->shared_rxvhdr));
+		/* Get and free any used buffers. This is necessary
+		 * before calling free_unused_bufs(), that uses
+		 * virtqueue_detach_unused_buf(). */
+		virtio_netmap_clean_used_rings(vi, na);
 
-			/* Get and free any used buffers. This is necessary
-			 * before calling free_unused_bufs(), that uses
-			 * virtqueue_detach_unused_buf(). */
-			virtio_netmap_clean_used_rings(vi, na);
+		/* Initialize scatter-gather lists used to publish netmap
+		 * buffers through virtio descriptors, in such a way that each
+		 * each scatter-gather list contains exactly one descriptor
+		 * (which can point to a netmap buffer). This initialization is
+		 * necessary to prevent the virtio frontend (host) to think
+		 * we are using multi-descriptors scatter-gather lists. */
+		virtio_netmap_init_sgs(vi);
 
-			/* Initialize scatter-gather lists used to publish netmap
-			 * buffers through virtio descriptors, in such a way that each
-			 * each scatter-gather list contains exactly one descriptor
-			 * (which can point to a netmap buffer). This initialization is
-			 * necessary to prevent the virtio frontend (host) to think
-			 * we are using multi-descriptors scatter-gather lists. */
-			virtio_netmap_init_sgs(vi);
-
-			/* We have to drain the RX virtqueues, otherwise the
-			 * virtio_netmap_init_buffer() called by the subsequent
-			 * virtnet_open() cannot link the netmap buffers to the
-			 * virtio RX ring.
-			 * The unused buffers point to memory allocated by
-			 * the virtio-driver (e.g. sk_buffs). We need to free that
-			 * memory, otherwise we have leakage.
-			 */
-			free_unused_bufs(vi);
-
-			/* Also free the pages allocated by the driver. Since
-			 * Linux 4.10, free_receive_bufs() takes the rtnl lock
-			 * to support XDP. To avoid deadlock, we temporarily
-			 * release the lock during this call. */
-			rtnl_unlock();
-			free_receive_bufs(vi);
-			rtnl_lock();
-		}
+		/* We have to drain the RX virtqueues, otherwise the
+		 * virtio_netmap_init_buffer() called by the subsequent
+		 * virtnet_open() cannot link the netmap buffers to the
+		 * virtio RX ring.
+		 * The unused buffers point to memory allocated by
+		 * the virtio-driver (e.g. sk_buffs). We need to free that
+		 * memory, otherwise we have leakage.
+		 */
+		free_unused_bufs(vi);
+		/* Also free the pages allocated by the driver. */
+		free_receive_bufs(vi);
 
 		/* enable netmap mode */
-		for_rx_tx(t) {
-			for (i = 0; i <= nma_get_nrings(na, t); i++) {
-				struct netmap_kring *kring = NMR(na, t)[i];
-
-				if (nm_kring_pending_on(kring)) {
-					kring->nr_mode = NKR_NETMAP_ON;
-				}
-			}
-		}
+		virtio_netmap_set_kring_mode(na, NKR_NETMAP_ON);
 		nm_set_native_flags(na);
 	} else {
 		nm_clear_native_flags(na);
-		for_rx_tx(t) {
-			for (i = 0; i <= nma_get_nrings(na, t); i++) {
-				struct netmap_kring *kring = NMR(na, t)[i];
+		virtio_netmap_set_kring_mode(na, NKR_NETMAP_OFF);
 
-				if (nm_kring_pending_off(kring)) {
-					kring->nr_mode = NKR_NETMAP_OFF;
-				}
-			}
-		}
+		/* Get and free any used buffer. This is necessary
+		 * before calling virtqueue_detach_unused_buf(). */
+		virtio_netmap_clean_used_rings(vi, na);
 
-		if (hwrings_pending) {
-			/* Get and free any used buffer. This is necessary
-			 * before calling virtqueue_detach_unused_buf(). */
-			virtio_netmap_clean_used_rings(vi, na);
-
-			virtio_netmap_reclaim_unused(vi);
-		}
+		virtio_netmap_reclaim_unused(vi);
 	}
 
 	if (was_up) {
@@ -377,6 +346,9 @@ virtio_netmap_reg(struct netmap_adapter *na, int onoff)
 
 	return (error);
 }
+
+static struct virtio_net_hdr_mrg_rxbuf shared_tx_vnet_hdr;
+static struct virtio_net_hdr_mrg_rxbuf shared_rx_vnet_hdr;
 
 /* Reconcile kernel and user view of the transmit ring. */
 static int
@@ -394,16 +366,13 @@ virtio_netmap_txsync(struct netmap_kring *kring, int flags)
 
 	/* device-specific */
 	COMPAT_DECL_SG
-	struct netmap_virtio_adapter *vna = (struct netmap_virtio_adapter *)na;
 	struct virtnet_info *vi = netdev_priv(ifp);
 	struct virtqueue *vq = GET_TX_VQ(vi, ring_nr);
 	struct scatterlist *sg = GET_TX_SG(vi, ring_nr);
 	size_t vnet_hdr_len = vi->mergeable_rx_bufs ?
-				sizeof(vna->shared_txvhdr) :
-				sizeof(vna->shared_txvhdr.hdr);
+				sizeof(shared_tx_vnet_hdr) :
+				sizeof(shared_tx_vnet_hdr.hdr);
 	struct netmap_adapter *token;
-	int interrupts = !(kring->nr_kflags & NKR_NOINTR);
-	int nospace = 0;
 
 	virtqueue_disable_cb(vq);
 
@@ -434,6 +403,8 @@ virtio_netmap_txsync(struct netmap_kring *kring, int flags)
 
 	nm_i = kring->nr_hwcur;
 	if (nm_i != head) {	/* we have new packets to send */
+		int nospace = 0;
+
 		nic_i = netmap_idx_k2n(kring, nm_i);
 		for (n = 0; nm_i != head; n++) {
 			struct netmap_slot *slot = &ring->slot[nm_i];
@@ -446,7 +417,7 @@ virtio_netmap_txsync(struct netmap_kring *kring, int flags)
 			/* Initialize the scatterlist and expose it to
 			 * the hypervisor. */
 			COMPAT_INIT_SG(sg);
-			sg_set_buf(sg, &vna->shared_txvhdr, vnet_hdr_len);
+			sg_set_buf(sg, &shared_tx_vnet_hdr, vnet_hdr_len);
 			sg_set_buf(sg + 1, addr, len);
 			nospace = virtqueue_add_outbuf(vq, sg, 2, na, GFP_ATOMIC);
 			if (nospace) {
@@ -463,15 +434,16 @@ virtio_netmap_txsync(struct netmap_kring *kring, int flags)
 
 		/* Update hwcur depending on where we stopped. */
 		kring->nr_hwcur = nm_i; /* note we migth break early */
+
+		/* No more free virtio descriptors or netmap slots? Ask the
+		 * hypervisor for notifications, possibly only when a
+		 * considerable amount of work has been done.
+		 */
+		if (nospace || nm_kr_txempty(kring)) {
+			virtqueue_enable_cb_delayed(vq);
+		}
 	}
 out:
-	/* No more free virtio descriptors or netmap slots? Ask the
-	 * hypervisor for notifications, possibly only when it has
-	 * freed a considerable amount of pending descriptors.
-	 */
-	if (interrupts && (nm_kr_txempty(kring) || nospace)) {
-		virtqueue_enable_cb_delayed(vq);
-	}
 
 	return 0;
 }
@@ -494,14 +466,12 @@ virtio_netmap_rxsync(struct netmap_kring *kring, int flags)
 
 	/* device-specific */
 	COMPAT_DECL_SG
-	struct netmap_virtio_adapter *vna = (struct netmap_virtio_adapter *)na;
 	struct virtnet_info *vi = netdev_priv(ifp);
 	struct virtqueue *vq = GET_RX_VQ(vi, ring_nr);
 	struct scatterlist *sg = GET_RX_SG(vi, ring_nr);
 	size_t vnet_hdr_len = vi->mergeable_rx_bufs ?
-				sizeof(vna->shared_rxvhdr) :
-				sizeof(vna->shared_rxvhdr.hdr);
-	int interrupts = !(kring->nr_kflags & NKR_NOINTR);
+				sizeof(shared_rx_vnet_hdr) :
+				sizeof(shared_rx_vnet_hdr.hdr);
 
 	/* XXX netif_carrier_ok ? */
 
@@ -513,19 +483,18 @@ virtio_netmap_rxsync(struct netmap_kring *kring, int flags)
 	rmb();
 	/*
 	 * First part: import newly received packets.
-	 * Only accept our own buffers (matching the token). We should only get
-	 * matching buffers, because of free_unused_bufs() and
-	 * virtio_netmap_init_buffers(). We may need to stop early to avoid
-	 * hwtail to overrun hwcur;
+	 * Only accept our
+	 * own buffers (matching the token). We should only get
+	 * matching buffers, because of free_unused_bufs()
+	 * and virtio_netmap_init_buffers().
 	 */
 	if (netmap_no_pendintr || force_update) {
-		uint32_t hwtail_lim = nm_prev(kring->nr_hwcur, lim);
+		uint16_t slot_flags = kring->nkr_slot_flags;
 		struct netmap_adapter *token;
-
 
 		nm_i = kring->nr_hwtail;
 		n = 0;
-		while (nm_i != hwtail_lim) {
+		for (;;) {
 			int len;
 			token = virtqueue_get_buf(vq, &len);
 			if (token == NULL)
@@ -546,7 +515,7 @@ virtio_netmap_rxsync(struct netmap_kring *kring, int flags)
 				}
 
 				ring->slot[nm_i].len = len;
-				ring->slot[nm_i].flags = 0;
+				ring->slot[nm_i].flags = slot_flags;
 				nm_i = nm_next(nm_i, lim);
 				n++;
 			}
@@ -577,7 +546,7 @@ virtio_netmap_rxsync(struct netmap_kring *kring, int flags)
 			/* Initialize the scatterlist and expose it to
 			 * the hypervisor. */
 			COMPAT_INIT_SG(sg);
-			sg_set_buf(sg, &vna->shared_rxvhdr, vnet_hdr_len);
+			sg_set_buf(sg, &shared_rx_vnet_hdr, vnet_hdr_len);
 			sg_set_buf(sg + 1, addr, NETMAP_BUF_SIZE(na));
 			nospace = virtqueue_add_inbuf(vq, sg, 2, na, GFP_ATOMIC);
 			if (nospace) {
@@ -596,9 +565,7 @@ virtio_netmap_rxsync(struct netmap_kring *kring, int flags)
 	 * the hypervisor to make a call when more used RX buffers will be
 	 * ready.
 	 */
-	if (interrupts) {
-		virtqueue_enable_cb(vq);
-	}
+	virtqueue_enable_cb(vq);
 
 
 	ND("[C] h %d c %d t %d hwcur %d hwtail %d",
@@ -615,18 +582,16 @@ virtio_netmap_init_buffers(struct virtnet_info *vi)
 {
 	struct ifnet *ifp = vi->dev;
 	struct netmap_adapter* na = NA(ifp);
-	struct netmap_virtio_adapter *vna = (struct netmap_virtio_adapter *)na;
 	size_t vnet_hdr_len = vi->mergeable_rx_bufs ?
-				sizeof(vna->shared_rxvhdr) :
-				sizeof(vna->shared_rxvhdr.hdr);
+				sizeof(shared_rx_vnet_hdr) :
+				sizeof(shared_rx_vnet_hdr.hdr);
 	unsigned int r;
 
 	if (!nm_native_on(na))
 		return 0;
-
 	for (r = 0; r < na->num_rx_rings; r++) {
 		COMPAT_DECL_SG
-		struct netmap_ring *ring = na->rx_rings[r]->ring;
+		struct netmap_ring *ring = na->rx_rings[r].ring;
 		struct virtqueue *vq = GET_RX_VQ(vi, r);
 		struct scatterlist *sg = GET_RX_SG(vi, r);
 		struct netmap_slot* slot;
@@ -635,25 +600,21 @@ virtio_netmap_init_buffers(struct virtnet_info *vi)
 
 		slot = netmap_reset(na, NR_RX, r, 0);
 		if (!slot) {
-			continue;
+			D("strange, null netmap ring %d", r);
+			return 0;
 		}
 
-		/*
-		 * Add exactly na->num_rx_desc descriptor chains to this RX
-		 * virtqueue, as virtio_netmap_rxsync() assumes the chains
-		 * are returned in the same order by virtqueue_get_buf().
-		 * It is technically possible that the hypervisor returns
-		 * na->num_rx_desc chains before the user can consume them,
-		 * so virtio_netmap_rxsync() must prevent ring->tail to
-		 * wrap around ring->head.
+		/* Add up to na>-num_rx_desc-1 buffers to this RX virtqueue.
+		 * It's important to leave one virtqueue slot free, otherwise
+		 * we can run into ring->cur/ring->tail wraparounds.
 		 */
-		for (i = 0; i < na->num_rx_desc; i++) {
+		for (i = 0; i < na->num_rx_desc-1; i++) {
 			void *addr;
 
 			slot = &ring->slot[i];
 			addr = NMB(na, slot);
 			COMPAT_INIT_SG(sg);
-			sg_set_buf(sg, &vna->shared_rxvhdr, vnet_hdr_len);
+			sg_set_buf(sg, &shared_rx_vnet_hdr, vnet_hdr_len);
 			sg_set_buf(sg + 1, addr, NETMAP_BUF_SIZE(na));
 			err = virtqueue_add_inbuf(vq, sg, 2, na, GFP_ATOMIC);
 			if (err < 0) {
@@ -669,37 +630,42 @@ virtio_netmap_init_buffers(struct virtnet_info *vi)
 		D("added %d inbufs on queue %d", i, r);
 		virtqueue_kick(vq);
 	}
+
 	return 1;
 }
 
-/* Enable/disable interrupts on all virtqueues. */
-static void
-virtio_netmap_intr(struct netmap_adapter *na, int onoff)
+/* Update the virtio-net device configurations. Number of queues can
+ * change dinamically, by 'ethtool --set-channels $IFNAME combined $N'.
+ * This is actually the only way virtio-net can currently enable
+ * the multiqueue mode.
+ */
+static int
+virtio_netmap_config(struct netmap_adapter *na, u_int *txr, u_int *txd,
+		     u_int *rxr, u_int *rxd)
 {
-	struct virtnet_info *vi = netdev_priv(na->ifp);
-	enum txrx t;
-	int i;
+	struct ifnet *ifp = na->ifp;
+	struct virtnet_info *vi = netdev_priv(ifp);
 
-	for_rx_tx(t) {
-		for (i = 0; i < nma_get_nrings(na, t); i++) {
-			struct virtqueue *vq;
+	*txr = ifp->real_num_tx_queues;
+	*txd = virtqueue_get_vring_size(GET_TX_VQ(vi, 0));
+	*rxr = 1;
+	*rxd = virtqueue_get_vring_size(GET_RX_VQ(vi, 0));
+	D("virtio config txq=%d, txd=%d rxq=%d, rxd=%d",
+			*txr, *txd, *rxr, *rxd);
 
-			vq = t == NR_RX ? GET_RX_VQ(vi, i) : GET_TX_VQ(vi, i);
-
-			if (onoff) {
-				virtqueue_enable_cb(vq);
-			} else {
-				virtqueue_disable_cb(vq);
-			}
-		}
-	}
+	return 0;
 }
 
 static void
 virtio_netmap_attach(struct virtnet_info *vi)
 {
 	struct netmap_adapter na; /* temporary container of methods */
-	int ret;
+
+	/* TX shared virtio-net header must be zeroed because its
+	 * content is exposed to the host. RX shared virtio-net
+	 * header is zeroed only for security reasons. */
+	bzero(&shared_tx_vnet_hdr, sizeof(shared_tx_vnet_hdr));
+	bzero(&shared_rx_vnet_hdr, sizeof(shared_rx_vnet_hdr));
 
 	bzero(&na, sizeof(na));
 
@@ -710,13 +676,9 @@ virtio_netmap_attach(struct virtnet_info *vi)
 	na.nm_register = virtio_netmap_reg;
 	na.nm_txsync = virtio_netmap_txsync;
 	na.nm_rxsync = virtio_netmap_rxsync;
-	na.nm_intr = virtio_netmap_intr;
+	na.nm_config = virtio_netmap_config;
 
-	ret = netmap_attach_ext(&na, sizeof(struct netmap_virtio_adapter), 1);
-	if (ret) {
-		D("Failed to attach virtio-net interface");
-		return;
-	}
+	netmap_attach(&na);
 
 	D("virtio attached txq=%d, txd=%d rxq=%d, rxd=%d",
 			na.num_tx_rings, na.num_tx_desc,

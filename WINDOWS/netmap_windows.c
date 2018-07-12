@@ -565,7 +565,7 @@ ioctlDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 		}
 
 		ret = netmap_ioctl(priv, irpSp->Parameters.DeviceIoControl.IoControlCode,
-			(caddr_t)&arg, NULL, 1);
+			(caddr_t)&arg, NULL);
 		if (NT_SUCCESS(ret)) {
 			if (data && !NT_SUCCESS(copy_to_user((void*)data, &arg, argsize, Irp))) {
 				DbgPrint("Netmap.sys: ioctl failure/cannot copy data to user");
@@ -885,16 +885,6 @@ bdg_mismatch_datapath(struct netmap_vp_adapter *na,
     DbgPrint("bdg_mismatch_datapath unimplemented!!!\n");
 }
 
-void if_ref(struct net_device *ifp)
-{
-	/*
-	* XXX This is just to shut up the compiler.
-	* I wouldn't know what to out in here yet...
-	*/
-	DbgPrint("unimplemented if_ref!!!\n");
-/* 	dev_hold(ifp); */
-}
-
 void
 if_rele(struct net_device *ifp)
 {
@@ -925,12 +915,6 @@ void
 nm_os_ifnet_fini(void)
 {
 
-}
-
-unsigned
-nm_os_ifnet_mtu(struct ifnet *ifp)
-{
-       return 1500; /* XXX hardwired */
 }
 
 /*
@@ -1017,13 +1001,7 @@ nm_os_ncpus(void)
 }
 
 int
-nm_os_mbuf_has_csum_offld(struct mbuf *m)
-{
-	return 0;  // TODO
-}
-
-int
-nm_os_mbuf_has_seg_offld(struct mbuf *m)
+nm_os_mbuf_has_offld(struct mbuf *m)
 {
 	return 0;  // TODO
 }
@@ -1041,39 +1019,40 @@ nm_os_put_module(void)
 }
 
 
-struct nm_kctx {
+struct nm_kthread {
     int unused; /* To avoid compiler barfs */
 };
 
 void
-nm_os_kctx_worker_setaff(struct nm_kctx *nmk, int affinity)
+nm_os_kthread_set_affinity(struct nm_kthread *nmk, int affinity)
 {
 	// TODO
 }
 
-struct nm_kctx *
-nm_os_kctx_create(struct nm_kctx_cfg *cfg, void *opaque)
+struct nm_kthread *
+nm_os_kthread_create(struct nm_kthread_cfg *cfg, unsigned int cfgtype,
+		     void *opaque)
 {
 	// TODO
 	return NULL;
 }
 
 int
-nm_os_kctx_worker_start(struct nm_kctx *nmk)
+nm_os_kthread_start(struct nm_kthread *nmk)
 {
 	// TODO
 	return -1;
 }
 
 void
-nm_os_kctx_worker_stop(struct nm_kctx *nmk)
+nm_os_kthread_stop(struct nm_kthread *nmk)
 {
 	// TODO
 }
 
 
 void
-nm_os_kctx_destroy(struct nm_kctx *nmk)
+nm_os_kthread_delete(struct nm_kthread *nmk)
 {
 	// TODO
 }

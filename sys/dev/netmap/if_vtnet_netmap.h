@@ -122,7 +122,6 @@ vtnet_netmap_txsync(struct netmap_kring *kring, int flags)
 	struct SOFTC_T *sc = ifp->if_softc;
 	struct vtnet_txq *txq = &sc->vtnet_txqs[ring_nr];
 	struct virtqueue *vq = txq->vtntx_vq;
-	int interrupts = !(kring->nr_kflags & NKR_NOINTR);
 
 	/*
 	 * First part: process new packets to send.
@@ -180,9 +179,7 @@ vtnet_netmap_txsync(struct netmap_kring *kring, int flags)
 			ring->head, ring->tail, virtqueue_nused(vq),
 			(virtqueue_dump(vq), 1));
 		virtqueue_notify(vq);
-		if (interrupts) {
-			virtqueue_enable_intr(vq); // like postpone with 0
-		}
+		virtqueue_enable_intr(vq); // like postpone with 0
 	}
 
 
@@ -212,7 +209,7 @@ vtnet_netmap_txsync(struct netmap_kring *kring, int flags)
 	if (nm_i != kring->nr_hwtail /* && vtnet_txq_below_threshold(txq) == 0*/) {
 		ND(3, "disable intr, hwcur %d", nm_i);
 		virtqueue_disable_intr(vq);
-	} else if (interrupts) {
+	} else {
 		ND(3, "enable intr, hwcur %d", nm_i);
 		virtqueue_postpone_intr(vq, VQ_POSTPONE_SHORT);
 	}
@@ -280,7 +277,6 @@ vtnet_netmap_rxsync(struct netmap_kring *kring, int flags)
 	u_int const lim = kring->nkr_num_slots - 1;
 	u_int const head = kring->rhead;
 	int force_update = (flags & NAF_FORCE_READ) || kring->nr_kflags & NKR_PENDINTR;
-	int interrupts = !(kring->nr_kflags & NKR_NOINTR);
 
 	/* device-specific */
 	struct SOFTC_T *sc = ifp->if_softc;
@@ -301,6 +297,7 @@ vtnet_netmap_rxsync(struct netmap_kring *kring, int flags)
 	 * and vtnet_netmap_init_buffers().
 	 */
 	if (netmap_no_pendintr || force_update) {
+		uint16_t slot_flags = kring->nkr_slot_flags;
                 struct netmap_adapter *token;
 
                 nm_i = kring->nr_hwtail;
@@ -312,7 +309,7 @@ vtnet_netmap_rxsync(struct netmap_kring *kring, int flags)
                                 break;
                         if (likely(token == (void *)rxq)) {
                             ring->slot[nm_i].len = len;
-                            ring->slot[nm_i].flags = 0;
+                            ring->slot[nm_i].flags = slot_flags;
                             nm_i = nm_next(nm_i, lim);
                             n++;
                         } else {
@@ -337,9 +334,7 @@ vtnet_netmap_rxsync(struct netmap_kring *kring, int flags)
 		kring->nr_hwcur = err;
 		virtqueue_notify(vq);
 		/* After draining the queue may need an intr from the hypervisor */
-		if (interrupts) {
-			vtnet_rxq_enable_intr(rxq);
-		}
+        	vtnet_rxq_enable_intr(rxq);
 	}
 
         ND("[C] h %d c %d t %d hwcur %d hwtail %d",
@@ -349,28 +344,6 @@ vtnet_netmap_rxsync(struct netmap_kring *kring, int flags)
 	return 0;
 }
 
-
-/* Enable/disable interrupts on all virtqueues. */
-static void
-vtnet_netmap_intr(struct netmap_adapter *na, int onoff)
-{
-	struct SOFTC_T *sc = na->ifp->if_softc;
-	int i;
-
-	for (i = 0; i < sc->vtnet_max_vq_pairs; i++) {
-		struct vtnet_rxq *rxq = &sc->vtnet_rxqs[i];
-		struct vtnet_txq *txq = &sc->vtnet_txqs[i];
-		struct virtqueue *txvq = txq->vtntx_vq;
-
-		if (onoff) {
-			vtnet_rxq_enable_intr(rxq);
-			virtqueue_enable_intr(txvq);
-		} else {
-			vtnet_rxq_disable_intr(rxq);
-			virtqueue_disable_intr(txvq);
-		}
-	}
-}
 
 /* Make RX virtqueues buffers pointing to netmap buffers. */
 static int
@@ -383,7 +356,7 @@ vtnet_netmap_init_rx_buffers(struct SOFTC_T *sc)
 	if (!nm_native_on(na))
 		return 0;
 	for (r = 0; r < na->num_rx_rings; r++) {
-                struct netmap_kring *kring = na->rx_rings[r];
+                struct netmap_kring *kring = &na->rx_rings[r];
 		struct vtnet_rxq *rxq = &sc->vtnet_rxqs[r];
 		struct virtqueue *vq = rxq->vtnrx_vq;
 	        struct netmap_slot* slot;
@@ -407,6 +380,29 @@ vtnet_netmap_init_rx_buffers(struct SOFTC_T *sc)
 	return 1;
 }
 
+/* Update the virtio-net device configurations. Number of queues can
+ * change dinamically, by 'ethtool --set-channels $IFNAME combined $N'.
+ * This is actually the only way virtio-net can currently enable
+ * the multiqueue mode.
+ * XXX note that we seem to lose packets if the netmap ring has more
+ * slots than the queue
+ */
+static int
+vtnet_netmap_config(struct netmap_adapter *na, u_int *txr, u_int *txd,
+						u_int *rxr, u_int *rxd)
+{
+	struct ifnet *ifp = na->ifp;
+	struct SOFTC_T *sc = ifp->if_softc;
+
+	*txr = *rxr = sc->vtnet_max_vq_pairs;
+	*rxd = 512; // sc->vtnet_rx_nmbufs;
+	*txd = *rxd; // XXX
+        D("vtnet config txq=%d, txd=%d rxq=%d, rxd=%d",
+					*txr, *txd, *rxr, *rxd);
+
+	return 0;
+}
+
 static void
 vtnet_netmap_attach(struct SOFTC_T *sc)
 {
@@ -420,7 +416,7 @@ vtnet_netmap_attach(struct SOFTC_T *sc)
 	na.nm_register = vtnet_netmap_reg;
 	na.nm_txsync = vtnet_netmap_txsync;
 	na.nm_rxsync = vtnet_netmap_rxsync;
-	na.nm_intr = vtnet_netmap_intr;
+	na.nm_config = vtnet_netmap_config;
 	na.num_tx_rings = na.num_rx_rings = sc->vtnet_max_vq_pairs;
 	D("max rings %d", sc->vtnet_max_vq_pairs);
 	netmap_attach(&na);
