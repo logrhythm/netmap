@@ -1,6 +1,6 @@
 # For multiple programs using a single source file each,
 # we can just define 'progs' and create custom targets.
-PROGS	=	bridge bridge-b
+PROGS	=	bridge
 LIBNETMAP =
 
 CLEANFILES = $(PROGS) *.o
@@ -31,8 +31,3 @@ install: $(PROGS:%=install-%)
 
 install-%:
 	install -D $* $(DESTDIR)/$(PREFIX)/bin/$*
-
-bridge-b: bridge-b.o
-
-bridge-b.o: bridge.c
-	$(CC) $(CFLAGS) -DBUSYWAIT -c $^ -o $@

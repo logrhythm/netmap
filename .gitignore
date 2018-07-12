@@ -5,9 +5,7 @@
 *.mod.c
 *.orig
 .*.swp
-config
 tags
-cscope.*
 modules.order
 Module.symvers
 .tmp_versions
@@ -21,7 +19,6 @@ r8169.c
 get-drivers
 igb*/
 ixgbe*/
-vmxnet*/
 log/
 scripts/conf
 virtio_net.c
@@ -52,8 +49,6 @@ utils/testmmap
 utils/vale-ctl
 utils/test_nm
 utils/cygwin1.dll
-utils/ctrl-api-test
-utils/functional
 examples/pkt-gen.exe
 examples/pkt-gen.exe.stackdump
 examples/pkt-gen-b.exe
@@ -75,8 +70,6 @@ read-vars.mak
 !LINUX/default-config.mak
 !LINUX/drv-subdir.mak
 !LINUX/read-vars.mak
-!LINUX/final-patches/*
 LINUX/scripts/conf
 config.mak
 *.rej
-utils/producer
