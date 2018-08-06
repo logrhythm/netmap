@@ -4,6 +4,8 @@
 ## Initial setup: 
 ##
 ## - a git clone of netmap/linux with all the netmap-* branches created (GITDIR)
+##   (also make sure that you have all the git tags in place; you may need to
+##    git fetch --tags from https://github.com/torvalds/linux.git)
 ##
 ## - a directory where the linux trees for each major version of linux can 
 ##   be extracted (LINUX_SOURCES)
@@ -66,6 +68,7 @@ PROGNAME=$0
 
 NETMAP_BRANCH=${NETMAP_BRANCH:-master}
 PARALLEL_MAKE=${PARALLEL_MAKE:-$(grep -c processor /proc/cpuinfo)}
+NP_DEBUG=${NP_DEBUG:-0}
 
 function error {
 	echo "$@" >&2
@@ -126,14 +129,14 @@ function driver-path()
 {
 	get-params "driver version" "$@"
 	
-	cat cache/$version/$driver/path 2>/dev/null && return
+	cat cache/$version/vanilla-$driver/path 2>/dev/null && return
 	local kern=$(get-kernel $version)
 	[ -z "$kern" ] && error "no such kernel version: $version"
-	mkdir -p cache/$version/$driver
+	mkdir -p cache/$version/vanilla-$driver
 	(
 		cd $kern
 		find drivers/net -name $driver
-	) | tee cache/$version/$driver/path
+	) | tee cache/$version/vanilla-$driver/path
 }
 
 
@@ -183,11 +186,21 @@ function get-range()
 	get-params "driver version1 version2"	 "$@"
 
 	local v=$version1
+	local nv
 	# while version is less than $version2
 	while scripts/vers -b $v $version2 -L; do
-		get-patch $driver $v
 		# compute next version
-		v=$(scripts/vers $v -i)
+		nv=$(scripts/vers $v -i)
+		if [ -z "$EXTDRV" ]; then
+			get-patch $driver $v
+		else
+			local V1=$(scripts/vers $v -c)
+			local V2=$(scripts/vers $nv -c)
+			local p=tmp-patches/external--$driver--$V1--$V2
+			touch $p
+			echo $p
+		fi
+		v=$nv
 	done
 }
 
@@ -349,7 +362,7 @@ function get-kernel()
 ##	as a default; if also the latter does not exist, the kernel is
 ##	configure using 'allmodconfig'.
 ##	Errors are logged to $LINUX_CONFIGS/linux-<version>.log.
-##	If $LINUX_SOURCES/linux-<version> already exists,
+##	If $LINUX_SOURCES/linux-<version>/.build-prep already exists,
 ##	nothing is done.
 ##	In all cases, the absolute path of linux-<version> is
 ##	output.
@@ -359,7 +372,7 @@ function build-prep()
 
 	local dst=$(get-kernel $version)
 
-	[ -z "$dst" ] && return
+	[ -f $dst/.build-prep ] && { echo $dst; return; }
 
 	(
 		cd $dst
@@ -367,6 +380,15 @@ function build-prep()
 			ln -s compiler-gcc4.h include/linux/compiler-gcc5.h
 		[ -e include/linux/compiler-gcc6.h ] ||
 			ln -s compiler-gcc5.h include/linux/compiler-gcc6.h
+		[ -e include/linux/compiler-gcc7.h ] ||
+			ln -s compiler-gcc6.h include/linux/compiler-gcc7.h
+		# force disabling PIE
+		sed -i -e '/^all: vmlinux/a\
+\
+KBUILD_CFLAGS += $(call cc-option, -fno-pie)\
+KBUILD_CFLAGS += $(call cc-option, -no-pie)\
+KBUILD_AFLAGS += $(call cc-option, -fno-pie)\
+KBUILD_CPPFLAGS += $(call cc-option, -fno-pie)' Makefile
 		if [ -f $LINUX_CONFIGS/config-$version ]; then
 			cp $LINUX_CONFIGS/config-$version .config
 			yes '' | make oldconfig
@@ -374,6 +396,7 @@ function build-prep()
 			make allmodconfig
 		fi
 		make modules_prepare
+		touch .build-prep
 	) >$dst.log 2>&1 || error "build-prep failed for linux $version. Please check $dst.log"
 	echo $dst
 }
@@ -387,14 +410,20 @@ function check-patch()
 {
 	get-params "patch" "$@"
 
+	local _patch=$(basename $patch)
 	# extract the left version
-	local v1=$(scripts/vers $patch -s -p -C)
+	local v1=$(scripts/vers $_patch -s -p -C)
 	# extract the right version
-	local v2=$(scripts/vers $patch -s -C)
+	local v2=$(scripts/vers $_patch -s -C)
 	# extract the uncoverted right version (might be 99999)
-	local end=$(scripts/vers $patch -s)
+	local end=$(scripts/vers $_patch -s)
 	# extract the driver name
-	local driver=$(scripts/vers $patch -s -p -p)
+	local driver=$(scripts/vers $_patch -s -p -p)
+	# possibly extract the selected driver version
+	driver_version=${driver#*:}
+	driver=${driver%%:*}
+	# extract the driver type (vanilla or external)
+	local dtype=$(scripts/vers $_patch -s -p -p -p)
 	local p=$(realpath $patch)
 	mkdir -p log
 	local log="$(realpath log)/$(basename $patch)"
@@ -407,7 +436,7 @@ function check-patch()
 
 	while scripts/vers -b $v1 $v2 -L; do
 		# cache lookup
-		local cache=$PWD/cache/$v1/$driver
+		local cache=$PWD/cache/$v1/$dtype-$driver${driver_version+:$driver_version}
 		mkdir -p $cache
 		local cpatch=$cache/patch
 		local cnmcommit=$cache/nmcommit
@@ -435,22 +464,40 @@ function check-patch()
 				error "no such kernel version: $v1"
 			fi
 			local tmpdir=$(mktemp -d)
-			trap "rm -rf $tmpdir" 0
+			if [ "$NP_DEBUG" -lt 1 ]; then
+				trap "rm -rf $tmpdir" 0
+			fi
+			echo "====== $tmpdir =====" >>$log
 			(cd ..; git archive $NETMAP_BRANCH | tar xf - -C $tmpdir )
 			pushd $tmpdir/LINUX >/dev/null
-			mkdir single-patch
 			rm -f patches
-			ln -s single-patch patches
-			cp $p single-patch
 			ok=false
-			cp /dev/null config.mak
+			config_opts=
+			if [ -z "$EXT_DRIVERS" ]; then
+				config_opts=--no-ext-drivers
+				mkdir single-patch
+				ln -s single-patch patches
+				cp $p single-patch
+			else
+				rm -rf ext-drivers
+				ln -s $EXT_DRIVERS ext-drivers
+				ln -s final-patches patches
+				if [ -n "$driver_version" ]; then
+					config_opts="$config_opts --select-version=$driver:$driver_version"
+				fi
+			fi
+			if [ "$driver" != "veth.c" ]; then
+				config_opts="$config_opts --disable-pipe"
+			fi
 			./configure --kernel-dir=$ksrc --driver-suffix=$DRIVER_SUFFIX \
 				--drivers=$driver \
 				--disable-generic \
 				--disable-vale \
 				--disable-monitor \
-				--disable-pipe \
 				--disable-ptnetmap \
+				--no-apps \
+				--kernel-opts=CONFIG_STACK_VALIDATION= \
+				$config_opts \
 				--cache=$cache >>$log
 			(make get-$driver && make -j $PARALLEL_MAKE) >>$log 2>&1 && ok=true
 			grep -q warning: $log && { warn=true; echo $warn > $cwarn; }
@@ -461,7 +508,9 @@ function check-patch()
 		fi
 		[ "$ok" = true ] || { echo FAILED; echo false > $cstatus; return 1; }
 		echo true > $cstatus
-		rm -rf $tmpdir
+		if [ "$NP_DEBUG" -lt 2 ]; then
+			rm -rf $tmpdir
+		fi
 		# compute next version
 		v1=$(scripts/vers $v1 -i)
 	done
@@ -482,8 +531,12 @@ function build-check()
 	get-params "driver" "$@"
 
 	mkdir -p failed-patches
+	local dtype=vanilla
+	if [ "$EXTDRV" = 1 ]; then
+		dtype=external
+	fi
 	local drv=$(basename $driver)
-	local patches=$(ls tmp-patches/vanilla--$drv--* 2>/dev/null)
+	local patches=$(ls tmp-patches/$dtype--$drv--* 2>/dev/null)
 	local p
 	for p in $patches; do
 		check-patch $p || mv $p failed-patches
@@ -521,8 +574,10 @@ function auto()
 	fi
 	get-range $driver $MINVERS $NEXTVERS
 	build-check $driver
-	minimize $driver
-	infty $driver $NEXTVERS
+	if [ -z "$EXTDRV" ]; then
+		minimize $driver
+		infty $driver $NEXTVERS
+	fi
 }
 
 ##
@@ -534,13 +589,28 @@ function forall()
 	shift
 
 	local driver
-	for driver in $(./configure --show-drivers); do
+	for driver in $(./configure --show${EXTDRV:+-ext}-drivers); do
 		$cmd $(basename $driver) "$@"
 	done
 }
 
 mkdir -p tmp-patches
 
+EXTDRV=
+if [ "$1" = -e ]; then
+	if [ -z "$EXT_DRIVERS" ]; then
+		echo "EXT_DRIVERS not set"
+		exit 1
+	fi
+	if ! [ -d "$EXT_DRIVERS" ]; then
+		echo "$EXT_DRIVERS not a directory"
+		exit 1
+	fi
+	EXTDRV=1
+	shift
+else
+	EXT_DRIVERS=
+fi
 COMMAND=$1; shift
 case $COMMAND in
 ##
