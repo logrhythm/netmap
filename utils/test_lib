@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+FUNCTIONAL=${FUNCTIONAL:-functional}
+export FUNCTIONAL
+
 ################################################################################
 # Creates the new file descriptor "3" and redirects it to stdout, then redirects
 # stderr e stdout to /dev/null. This way only the stuff we redirect to fd 3 is
@@ -28,7 +32,7 @@ function stdout_echo() {
 #   None
 ################################################################################
 function close_fd_server() {
-	functional -c
+	$FUNCTIONAL -c
 	check_success "$?" "close_fd_server"
 }
 
@@ -38,7 +42,7 @@ function close_fd_server() {
 #   None
 ################################################################################
 function start_fd_server() {
-	functional -o
+	$FUNCTIONAL -o
 	check_success "$?" "start_fd_server"
 }
 
@@ -274,7 +278,6 @@ function parse_send_recv_arguments() {
 	done
 }
 
-
 ################################################################################
 # Prints to stdout the hexadecimal representation of the received integer.
 # Arguments:
@@ -307,4 +310,46 @@ function get_random_MAC() {
 	else
 		echo "$MAC"
 	fi
+}
+
+################################################################################
+# Loads the netmap module, if needed.
+# Arguments:
+#   None
+################################################################################
+function netmap_load() {
+	os=$(uname -s)
+	case $os in
+		Linux)
+			modprobe netmap
+			;;
+		FreeBSD)
+			# Nothing to do. We assume it is built in-kernel.
+			;;
+		*)
+			echo "$os not supported"
+			exit 1
+			;;
+	esac
+}
+
+################################################################################
+# Unloads the netmap module, if needed.
+# Arguments:
+#   None
+################################################################################
+function netmap_unload() {
+	os=$(uname -s)
+	case $os in
+		Linux)
+			rmmod netmap
+			;;
+		FreeBSD)
+			# Nothing to do.
+			;;
+		*)
+			echo "$os not supported"
+			exit 1
+			;;
+	esac
 }

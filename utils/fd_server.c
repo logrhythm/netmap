@@ -12,21 +12,28 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <syslog.h>
+#include <unistd.h>
 
-#include <net/netmap.h>
-#define NETMAP_WITH_LIBS
-#include <net/netmap_user.h>
+#include <libnetmap.h>
 
 #include "fd_server.h"
 
 struct nmd_entry {
 	char if_name[NETMAP_REQ_IFNAMSIZ];
-	struct nm_desc *nmd;
+	struct nmport_d *nmd;
 	uint8_t is_in_use;
 	uint8_t is_open;
 };
 
-#define printf(format, ...) syslog(LOG_NOTICE, format, ##__VA_ARGS__)
+int foreground = 0;
+
+#define msg(format, ...) do {					\
+	if (foreground) {					\
+		printf(format, ##__VA_ARGS__);			\
+	} else {						\
+		syslog(LOG_NOTICE, format, ##__VA_ARGS__);	\
+	}							\
+} while(0)
 
 #define MAX_OPEN_IF 128
 struct nmd_entry entries[MAX_OPEN_IF];
@@ -36,7 +43,7 @@ static void
 print_request(struct fd_request *req)
 {
 
-	printf("action: %s, if_name: '%s'\n",
+	msg("action: %s, if_name: '%s'\n",
 	       req->action == FD_GET
 	               ? "FD_GET"
 	               : req->action == FD_RELEASE
@@ -51,11 +58,11 @@ search_des(const char *if_name)
 {
 	int i;
 
-	// printf("searching %s\n", if_name);
+	// msg("searching %s\n", if_name);
 	for (i = 0; i < num_entries; ++i) {
 		struct nmd_entry *entry = &entries[i];
 
-		// printf("i=%d, is_open=%d, is_in_use=%d, if_name=%s\n",
+		// msg("i=%d, is_open=%d, is_in_use=%d, if_name=%s\n",
 		// 	i, entry->is_open, entry->is_in_use, entry->if_name);
 
 		if (entry->is_open == 0) {
@@ -63,12 +70,12 @@ search_des(const char *if_name)
 		}
 
 		if (strncmp(entry->if_name, if_name, IFNAMSIZ) == 0) {
-			// printf("finished searching with a match\n");
+			// msg("finished searching with a match\n");
 			return entry;
 		}
 	}
 
-	// printf("finished searching without a match\n");
+	// msg("finished searching without a match\n");
 	return NULL;
 }
 
@@ -83,6 +90,24 @@ get_free_des(void)
 }
 
 int
+marshal(struct fd_response *res, struct nmd_entry *entry)
+{
+	if (entry->nmd->hdr.nr_options) {
+		msg("options are not supported\n");
+		res->result = EOPNOTSUPP;
+		return -1;
+	}
+
+	// copy the header
+	res->hdr = entry->nmd->hdr;
+	res->hdr.nr_options = 0;
+	res->hdr.nr_body = 0;
+	// copy the body
+	res->reg = entry->nmd->reg;
+	return 0;
+}
+
+int
 get_fd(const char *if_name, struct fd_response *res)
 {
 	struct nmd_entry *entry;
@@ -90,31 +115,34 @@ get_fd(const char *if_name, struct fd_response *res)
 	entry = search_des(if_name);
 	if (entry != NULL) {
 		if (entry->is_in_use == 1) {
-			printf("if_name %s is in use\n", if_name);
+			msg("if_name %s is in use\n", if_name);
 			res->result = EBUSY;
 			return -1;
 		}
-		memcpy(&res->req, &entry->nmd->req, sizeof(entry->nmd->req));
+		if (marshal(res, entry) < 0)
+			return -1;
 		return entry->nmd->fd;
 	}
 
 	entry = get_free_des();
 	if (entry == NULL) {
-		printf("Out of memory\n");
+		msg("Out of memory\n");
 		res->result = ENOMEM;
 		return -1;
 	}
 
-	entry->nmd = nm_open(if_name, NULL, 0, NULL);
+	entry->nmd = nmport_open(if_name);
 	if (entry->nmd == NULL) {
-		printf("Failed to nm_open(%s) with error %d\n", if_name, errno);
+		msg("Failed to nm_open(%s) with error %d\n", if_name, errno);
 		res->result = errno;
 		return -1;
 	}
 	strncpy(entry->if_name, if_name, sizeof(entry->if_name));
 	entry->if_name[sizeof(entry->if_name) - 1] = '\0';
 
-	memcpy(&res->req, &entry->nmd->req, sizeof(entry->nmd->req));
+	if (marshal(res, entry) < 0)
+		return -1;
+	res->result = 0;
 	entry->is_in_use = 1;
 	entry->is_open   = 1;
 	return entry->nmd->fd;
@@ -127,7 +155,7 @@ release_fd(const char *if_name, struct fd_response *res)
 
 	entry = search_des(if_name);
 	if (entry == NULL) {
-		printf("if_name %s isn't open\n", if_name);
+		msg("if_name %s isn't open\n", if_name);
 		res->result = ENOENT;
 		return;
 	}
@@ -139,7 +167,6 @@ void
 close_fd(const char *if_name, struct fd_response *res)
 {
 	struct nmd_entry *entry;
-	int ret;
 
 	if (if_name == NULL || strnlen(if_name, NETMAP_REQ_IFNAMSIZ) == 0) {
 		res->result = EINVAL;
@@ -149,16 +176,12 @@ close_fd(const char *if_name, struct fd_response *res)
 	entry = search_des(if_name);
 	if (entry == NULL) {
 		res->result = ENOENT;
-		printf("if_name %s hasn't been opened\n", if_name);
+		msg("if_name %s hasn't been opened\n", if_name);
 		return;
 	}
 
-	ret         = nm_close(entry->nmd);
-	res->result = ret;
-	if (ret != 0) {
-		printf("error while close interface %s\n", if_name);
-		return;
-	}
+	nmport_close(entry->nmd);
+	res->result = 0;
 	entry->is_in_use = 0;
 	entry->is_open   = 0;
 }
@@ -185,7 +208,7 @@ send_fd(int socket, int fd, void *buf, size_t buf_size)
 		/* We need the ancillary data only when we're sending a file
 		 * descriptor, and a file descriptor cannot be negative.
 		 */
-		printf("sending a file descriptor\n");
+		msg("sending a file descriptor\n");
 		msg.msg_control         = ancillary.buf;
 		msg.msg_controllen      = sizeof(ancillary.buf);
 		cmsg                    = CMSG_FIRSTHDR(&msg);
@@ -211,12 +234,11 @@ handle_request(int accept_socket, int listen_socket)
 	memset(&req, 0, sizeof(req));
 	amount = recv(accept_socket, &req, sizeof(struct fd_request), 0);
 	if (amount == -1) {
-		printf("error while receiving the request\n");
+		msg("error while receiving the request\n");
 		return -1;
 	}
 
 	print_request(&req);
-	memset(&res, 0, sizeof(res));
 	switch (req.action) {
 	case FD_GET:
 		fd = get_fd(req.if_name, &res);
@@ -228,7 +250,7 @@ handle_request(int accept_socket, int listen_socket)
 		close_fd(req.if_name, &res);
 		return 0;
 	case FD_STOP:
-		printf("shutting down\n");
+		msg("shutting down\n");
 		close(listen_socket);
 		close(accept_socket);
 		exit(EXIT_SUCCESS);
@@ -237,9 +259,9 @@ handle_request(int accept_socket, int listen_socket)
 		res.result = EOPNOTSUPP;
 	}
 
-	ret = send_fd(accept_socket, fd, &res, sizeof(struct fd_response));
+	ret = send_fd(accept_socket, fd, &res, sizeof(res));
 	if (ret == -1) {
-		printf("error while sending the reponse\n");
+		msg("error while sending the reponse\n");
 	}
 	return ret;
 }
@@ -251,14 +273,14 @@ main_loop(void)
 	int socket_fd;
 	int ret;
 
-	printf("starting up.\n");
+	msg("starting up.\n");
 	if (unlink(SOCKET_NAME) == -1 && errno != ENOENT) {
-		printf("error %d during unlink()", errno);
+		msg("error %d during unlink()", errno);
 		exit(EXIT_FAILURE);
 	}
 	socket_fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
 	if (socket_fd == -1) {
-		printf("error during socket()\n");
+		msg("error during socket()\n");
 		exit(EXIT_FAILURE);
 	}
 
@@ -268,30 +290,30 @@ main_loop(void)
 	ret = bind(socket_fd, (const struct sockaddr *)&name,
 	           sizeof(struct sockaddr_un));
 	if (ret == -1) {
-		printf("error during bind()\n");
+		msg("error during bind()\n");
 		exit(EXIT_FAILURE);
 	}
 
 	ret = listen(socket_fd, 2);
 	if (ret == -1) {
-		printf("error during listen()");
+		msg("error during listen()");
 		exit(EXIT_FAILURE);
 	}
 
-	printf("listening\n");
+	msg("listening\n");
 	for (;;) {
 		int conn_fd;
 		int ret;
 
 		conn_fd = accept(socket_fd, NULL, NULL);
 		if (conn_fd == -1) {
-			printf("error during accept(), shutting down\n");
+			msg("error during accept(), shutting down\n");
 			exit(EXIT_FAILURE);
 		}
 
 		ret = handle_request(conn_fd, socket_fd);
 		if (ret == -1) {
-			printf("error while handling a request\n");
+			msg("error while handling a request\n");
 		}
 		(void)ret;
 		close(conn_fd);
@@ -341,9 +363,23 @@ daemonize(void)
 }
 
 int
-main()
+main(int argc, char *argv[])
 {
-	daemonize();
+	int opt;
+
+	while ( (opt = getopt(argc, argv, "f")) != -1) {
+		switch (opt) {
+		case 'f':
+			foreground = 1;
+			break;
+		default:
+			fprintf(stderr, "Unknown option: %c\n", opt);
+			exit(EXIT_FAILURE);
+			break;
+		}
+	}
+	if (!foreground)
+		daemonize();
 	main_loop();
 	return 0;
 }

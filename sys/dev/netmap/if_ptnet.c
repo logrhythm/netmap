@@ -68,7 +68,6 @@
 #include <netinet6/ip6_var.h>
 #include <netinet/udp.h>
 #include <netinet/tcp.h>
-#include <netinet/sctp.h>
 
 #include <machine/bus.h>
 #include <machine/resource.h>
@@ -87,6 +86,8 @@
 #include <net/netmap_virt.h>
 #include <dev/netmap/netmap_mem2.h>
 #include <dev/virtio/network/virtio_net.h>
+
+#ifdef WITH_PTNETMAP
 
 #ifndef INET
 #error "INET not defined, cannot support offloadings"
@@ -128,8 +129,8 @@ struct ptnet_queue {
 	struct				resource *irq;
 	void				*cookie;
 	int				kring_id;
-	struct ptnet_csb_gh		*ptgh;
-	struct ptnet_csb_hg		*pthg;
+	struct nm_csb_atok		*atok;
+	struct nm_csb_ktoa		*ktoa;
 	unsigned int			kick;
 	struct mtx			lock;
 	struct buf_ring			*bufring; /* for TX queues */
@@ -166,8 +167,8 @@ struct ptnet_softc {
 	unsigned int		num_tx_rings;
 	struct ptnet_queue	*queues;
 	struct ptnet_queue	*rxqueues;
-	struct ptnet_csb_gh    *csb_gh;
-	struct ptnet_csb_hg    *csb_hg;
+	struct nm_csb_atok	*csb_gh;
+	struct nm_csb_ktoa	*csb_hg;
 
 	unsigned int		min_tx_space;
 
@@ -209,7 +210,7 @@ static void	ptnet_tick(void *opaque);
 static int	ptnet_irqs_init(struct ptnet_softc *sc);
 static void	ptnet_irqs_fini(struct ptnet_softc *sc);
 
-static uint32_t ptnet_nm_ptctl(if_t ifp, uint32_t cmd);
+static uint32_t ptnet_nm_ptctl(struct ptnet_softc *sc, uint32_t cmd);
 static int      ptnet_nm_config(struct netmap_adapter *na,
 				struct nm_config_info *info);
 static void	ptnet_update_vnet_hdr(struct ptnet_softc *sc);
@@ -281,9 +282,8 @@ static inline void ptnet_kick(struct ptnet_queue *pq)
 #define PTNET_HDR_SIZE		sizeof(struct virtio_net_hdr_mrg_rxbuf)
 #define PTNET_MAX_PKT_SIZE	65536
 
-#define PTNET_CSUM_OFFLOAD	(CSUM_TCP | CSUM_UDP | CSUM_SCTP)
-#define PTNET_CSUM_OFFLOAD_IPV6	(CSUM_TCP_IPV6 | CSUM_UDP_IPV6 |\
-				 CSUM_SCTP_IPV6)
+#define PTNET_CSUM_OFFLOAD	(CSUM_TCP | CSUM_UDP)
+#define PTNET_CSUM_OFFLOAD_IPV6	(CSUM_TCP_IPV6 | CSUM_UDP_IPV6)
 #define PTNET_ALL_OFFLOAD	(CSUM_TSO | PTNET_CSUM_OFFLOAD |\
 				 PTNET_CSUM_OFFLOAD_IPV6)
 
@@ -327,7 +327,7 @@ ptnet_attach(device_t dev)
 	sc->num_rings = num_tx_rings + num_rx_rings;
 	sc->num_tx_rings = num_tx_rings;
 
-	if (sc->num_rings * sizeof(struct ptnet_csb_gh) > PAGE_SIZE) {
+	if (sc->num_rings * sizeof(struct nm_csb_atok) > PAGE_SIZE) {
 		device_printf(dev, "CSB cannot handle that many rings (%u)\n",
 				sc->num_rings);
 		err = ENOMEM;
@@ -342,7 +342,7 @@ ptnet_attach(device_t dev)
 		err = ENOMEM;
 		goto err_path;
 	}
-	sc->csb_hg = (struct ptnet_csb_hg *)(((char *)sc->csb_gh) + PAGE_SIZE);
+	sc->csb_hg = (struct nm_csb_ktoa *)(((char *)sc->csb_gh) + PAGE_SIZE);
 
 	{
 		/*
@@ -379,8 +379,8 @@ ptnet_attach(device_t dev)
 		pq->sc = sc;
 		pq->kring_id = i;
 		pq->kick = PTNET_IO_KICK_BASE + 4 * i;
-		pq->ptgh = sc->csb_gh + i;
-		pq->pthg = sc->csb_hg + i;
+		pq->atok = sc->csb_gh + i;
+		pq->ktoa = sc->csb_hg + i;
 		snprintf(pq->lock_name, sizeof(pq->lock_name), "%s-%d",
 			 device_get_nameunit(dev), i);
 		mtx_init(&pq->lock, pq->lock_name, NULL, MTX_DEF);
@@ -505,11 +505,24 @@ err_path:
 	return err;
 }
 
+/* Stop host sync-kloop if it was running. */
+static void
+ptnet_device_shutdown(struct ptnet_softc *sc)
+{
+	ptnet_nm_ptctl(sc, PTNETMAP_PTCTL_DELETE);
+	bus_write_4(sc->iomem, PTNET_IO_CSB_GH_BAH, 0);
+	bus_write_4(sc->iomem, PTNET_IO_CSB_GH_BAL, 0);
+	bus_write_4(sc->iomem, PTNET_IO_CSB_HG_BAH, 0);
+	bus_write_4(sc->iomem, PTNET_IO_CSB_HG_BAL, 0);
+}
+
 static int
 ptnet_detach(device_t dev)
 {
 	struct ptnet_softc *sc = device_get_softc(dev);
 	int i;
+
+	ptnet_device_shutdown(sc);
 
 #ifdef DEVICE_POLLING
 	if (sc->ifp->if_capenable & IFCAP_POLLING) {
@@ -543,10 +556,6 @@ ptnet_detach(device_t dev)
 	ptnet_irqs_fini(sc);
 
 	if (sc->csb_gh) {
-		bus_write_4(sc->iomem, PTNET_IO_CSB_GH_BAH, 0);
-		bus_write_4(sc->iomem, PTNET_IO_CSB_GH_BAL, 0);
-		bus_write_4(sc->iomem, PTNET_IO_CSB_HG_BAH, 0);
-		bus_write_4(sc->iomem, PTNET_IO_CSB_HG_BAL, 0);
 		contigfree(sc->csb_gh, 2*PAGE_SIZE, M_DEVBUF);
 		sc->csb_gh = NULL;
 		sc->csb_hg = NULL;
@@ -583,9 +592,8 @@ ptnet_detach(device_t dev)
 static int
 ptnet_suspend(device_t dev)
 {
-	struct ptnet_softc *sc;
+	struct ptnet_softc *sc = device_get_softc(dev);
 
-	sc = device_get_softc(dev);
 	(void)sc;
 
 	return (0);
@@ -594,9 +602,8 @@ ptnet_suspend(device_t dev)
 static int
 ptnet_resume(device_t dev)
 {
-	struct ptnet_softc *sc;
+	struct ptnet_softc *sc = device_get_softc(dev);
 
-	sc = device_get_softc(dev);
 	(void)sc;
 
 	return (0);
@@ -605,11 +612,11 @@ ptnet_resume(device_t dev)
 static int
 ptnet_shutdown(device_t dev)
 {
-	/*
-	 * Suspend already does all of what we need to
-	 * do here; we just never expect to be resumed.
-	 */
-	return (ptnet_suspend(dev));
+	struct ptnet_softc *sc = device_get_softc(dev);
+
+	ptnet_device_shutdown(sc);
+
+	return (0);
 }
 
 static int
@@ -688,11 +695,12 @@ ptnet_irqs_init(struct ptnet_softc *sc)
 	cpu_cur = CPU_FIRST();
 	for (i = 0; i < nvecs; i++) {
 		struct ptnet_queue *pq = sc->queues + i;
-		static void (*handler)(void *context, int pending);
 
-		handler = (i < sc->num_tx_rings) ? ptnet_tx_task : ptnet_rx_task;
+		if (i < sc->num_tx_rings)
+			TASK_INIT(&pq->task, 0, ptnet_tx_task, pq);
+		else
+			NET_TASK_INIT(&pq->task, 0, ptnet_rx_task, pq);
 
-		TASK_INIT(&pq->task, 0, handler, pq);
 		pq->taskq = taskqueue_create_fast("ptnet_queue", M_NOWAIT,
 					taskqueue_thread_enqueue, &pq->taskq);
 		taskqueue_start_threads(&pq->taskq, 1, PI_NET, "%s-pq-%d",
@@ -757,7 +765,7 @@ ptnet_ioctl(if_t ifp, u_long cmd, caddr_t data)
 	struct ptnet_softc *sc = if_getsoftc(ifp);
 	device_t dev = sc->dev;
 	struct ifreq *ifr = (struct ifreq *)data;
-	int mask, err = 0;
+	int mask __unused, err = 0;
 
 	switch (cmd) {
 	case SIOCSIFFLAGS:
@@ -796,7 +804,7 @@ ptnet_ioctl(if_t ifp, u_long cmd, caddr_t data)
 					/* Make sure the worker sees the
 					 * IFF_DRV_RUNNING down. */
 					PTNET_Q_LOCK(pq);
-					pq->ptgh->guest_need_kick = 0;
+					pq->atok->appl_need_kick = 0;
 					PTNET_Q_UNLOCK(pq);
 					/* Wait for rescheduling to finish. */
 					if (pq->taskq) {
@@ -810,7 +818,7 @@ ptnet_ioctl(if_t ifp, u_long cmd, caddr_t data)
 				for (i = 0; i < sc->num_rings; i++) {
 					pq = sc-> queues + i;
 					PTNET_Q_LOCK(pq);
-					pq->ptgh->guest_need_kick = 1;
+					pq->atok->appl_need_kick = 1;
 					PTNET_Q_UNLOCK(pq);
 				}
 			}
@@ -881,7 +889,7 @@ ptnet_init_locked(struct ptnet_softc *sc)
 		return ret;
 	}
 
-	if (sc->ptna->backend_regifs == 0) {
+	if (sc->ptna->backend_users == 0) {
 		ret = ptnet_nm_krings_create(na_nm);
 		if (ret) {
 			device_printf(sc->dev, "ptnet_nm_krings_create() "
@@ -962,7 +970,7 @@ ptnet_stop(struct ptnet_softc *sc)
 
 	ptnet_nm_register(na_dr, 0 /* off */);
 
-	if (sc->ptna->backend_regifs == 0) {
+	if (sc->ptna->backend_users == 0) {
 		netmap_mem_rings_delete(na_dr);
 		ptnet_nm_krings_delete(na_nm);
 	}
@@ -1092,9 +1100,8 @@ ptnet_media_status(if_t ifp, struct ifmediareq *ifmr)
 }
 
 static uint32_t
-ptnet_nm_ptctl(if_t ifp, uint32_t cmd)
+ptnet_nm_ptctl(struct ptnet_softc *sc, uint32_t cmd)
 {
-	struct ptnet_softc *sc = if_getsoftc(ifp);
 	/*
 	 * Write a command and read back error status,
 	 * with zero meaning success.
@@ -1130,8 +1137,8 @@ ptnet_sync_from_csb(struct ptnet_softc *sc, struct netmap_adapter *na)
 	/* Sync krings from the host, reading from
 	 * CSB. */
 	for (i = 0; i < sc->num_rings; i++) {
-		struct ptnet_csb_gh *ptgh = sc->queues[i].ptgh;
-		struct ptnet_csb_hg *pthg = sc->queues[i].pthg;
+		struct nm_csb_atok *atok = sc->queues[i].atok;
+		struct nm_csb_ktoa *ktoa = sc->queues[i].ktoa;
 		struct netmap_kring *kring;
 
 		if (i < na->num_tx_rings) {
@@ -1139,16 +1146,16 @@ ptnet_sync_from_csb(struct ptnet_softc *sc, struct netmap_adapter *na)
 		} else {
 			kring = na->rx_rings[i - na->num_tx_rings];
 		}
-		kring->rhead = kring->ring->head = ptgh->head;
-		kring->rcur = kring->ring->cur = ptgh->cur;
-		kring->nr_hwcur = pthg->hwcur;
+		kring->rhead = kring->ring->head = atok->head;
+		kring->rcur = kring->ring->cur = atok->cur;
+		kring->nr_hwcur = ktoa->hwcur;
 		kring->nr_hwtail = kring->rtail =
-			kring->ring->tail = pthg->hwtail;
+			kring->ring->tail = ktoa->hwtail;
 
-		ND("%d,%d: csb {hc %u h %u c %u ht %u}", t, i,
-		   pthg->hwcur, ptgh->head, ptgh->cur,
-		   pthg->hwtail);
-		ND("%d,%d: kring {hc %u rh %u rc %u h %u c %u ht %u rt %u t %u}",
+		nm_prdis("%d,%d: csb {hc %u h %u c %u ht %u}", t, i,
+		   ktoa->hwcur, atok->head, atok->cur,
+		   ktoa->hwtail);
+		nm_prdis("%d,%d: kring {hc %u rh %u rc %u h %u c %u ht %u rt %u t %u}",
 		   t, i, kring->nr_hwcur, kring->rhead, kring->rcur,
 		   kring->ring->head, kring->ring->cur, kring->nr_hwtail,
 		   kring->rtail, kring->ring->tail);
@@ -1173,12 +1180,11 @@ ptnet_nm_register(struct netmap_adapter *na, int onoff)
 	struct ptnet_softc *sc = if_getsoftc(ifp);
 	int native = (na == &sc->ptna->hwup.up);
 	struct ptnet_queue *pq;
-	enum txrx t;
 	int ret = 0;
 	int i;
 
 	if (!onoff) {
-		sc->ptna->backend_regifs--;
+		sc->ptna->backend_users--;
 	}
 
 	/* If this is the last netmap client, guest interrupt enable flags may
@@ -1188,20 +1194,20 @@ ptnet_nm_register(struct netmap_adapter *na, int onoff)
 	 * in the RX rings, since we will not receive further interrupts
 	 * until these will be processed. */
 	if (native && !onoff && na->active_fds == 0) {
-		D("Exit netmap mode, re-enable interrupts");
+		nm_prinf("Exit netmap mode, re-enable interrupts");
 		for (i = 0; i < sc->num_rings; i++) {
 			pq = sc->queues + i;
-			pq->ptgh->guest_need_kick = 1;
+			pq->atok->appl_need_kick = 1;
 		}
 	}
 
 	if (onoff) {
-		if (sc->ptna->backend_regifs == 0) {
+		if (sc->ptna->backend_users == 0) {
 			/* Initialize notification enable fields in the CSB. */
 			for (i = 0; i < sc->num_rings; i++) {
 				pq = sc->queues + i;
-				pq->pthg->host_need_kick = 1;
-				pq->ptgh->guest_need_kick =
+				pq->ktoa->kern_need_kick = 1;
+				pq->atok->appl_need_kick =
 					(!(ifp->if_capenable & IFCAP_POLLING)
 						&& i >= sc->num_tx_rings);
 			}
@@ -1211,62 +1217,36 @@ ptnet_nm_register(struct netmap_adapter *na, int onoff)
 
 			/* Make sure the host adapter passed through is ready
 			 * for txsync/rxsync. */
-			ret = ptnet_nm_ptctl(ifp, PTNETMAP_PTCTL_CREATE);
+			ret = ptnet_nm_ptctl(sc, PTNETMAP_PTCTL_CREATE);
 			if (ret) {
 				return ret;
 			}
-		}
 
-		/* Sync from CSB must be done after REGIF PTCTL. Skip this
-		 * step only if this is a netmap client and it is not the
-		 * first one. */
-		if ((!native && sc->ptna->backend_regifs == 0) ||
-				(native && na->active_fds == 0)) {
+			/* Align the guest krings and rings to the state stored
+			 * in the CSB. */
 			ptnet_sync_from_csb(sc, na);
 		}
 
 		/* If not native, don't call nm_set_native_flags, since we don't want
 		 * to replace if_transmit method, nor set NAF_NETMAP_ON */
 		if (native) {
-			for_rx_tx(t) {
-				for (i = 0; i <= nma_get_nrings(na, t); i++) {
-					struct netmap_kring *kring = NMR(na, t)[i];
-
-					if (nm_kring_pending_on(kring)) {
-						kring->nr_mode = NKR_NETMAP_ON;
-					}
-				}
-			}
+			netmap_krings_mode_commit(na, onoff);
 			nm_set_native_flags(na);
 		}
 
 	} else {
 		if (native) {
 			nm_clear_native_flags(na);
-			for_rx_tx(t) {
-				for (i = 0; i <= nma_get_nrings(na, t); i++) {
-					struct netmap_kring *kring = NMR(na, t)[i];
-
-					if (nm_kring_pending_off(kring)) {
-						kring->nr_mode = NKR_NETMAP_OFF;
-					}
-				}
-			}
+			netmap_krings_mode_commit(na, onoff);
 		}
 
-		/* Sync from CSB must be done before UNREGIF PTCTL, on the last
-		 * netmap client. */
-		if (native && na->active_fds == 0) {
-			ptnet_sync_from_csb(sc, na);
-		}
-
-		if (sc->ptna->backend_regifs == 0) {
-			ret = ptnet_nm_ptctl(ifp, PTNETMAP_PTCTL_DELETE);
+		if (sc->ptna->backend_users == 0) {
+			ret = ptnet_nm_ptctl(sc, PTNETMAP_PTCTL_DELETE);
 		}
 	}
 
 	if (onoff) {
-		sc->ptna->backend_regifs++;
+		sc->ptna->backend_users++;
 	}
 
 	return ret;
@@ -1279,7 +1259,7 @@ ptnet_nm_txsync(struct netmap_kring *kring, int flags)
 	struct ptnet_queue *pq = sc->queues + kring->ring_id;
 	bool notify;
 
-	notify = netmap_pt_guest_txsync(pq->ptgh, pq->pthg, kring, flags);
+	notify = netmap_pt_guest_txsync(pq->atok, pq->ktoa, kring, flags);
 	if (notify) {
 		ptnet_kick(pq);
 	}
@@ -1294,7 +1274,7 @@ ptnet_nm_rxsync(struct netmap_kring *kring, int flags)
 	struct ptnet_queue *pq = sc->rxqueues + kring->ring_id;
 	bool notify;
 
-	notify = netmap_pt_guest_rxsync(pq->ptgh, pq->pthg, kring, flags);
+	notify = netmap_pt_guest_rxsync(pq->atok, pq->ktoa, kring, flags);
 	if (notify) {
 		ptnet_kick(pq);
 	}
@@ -1310,7 +1290,7 @@ ptnet_nm_intr(struct netmap_adapter *na, int onoff)
 
 	for (i = 0; i < sc->num_rings; i++) {
 		struct ptnet_queue *pq = sc->queues + i;
-		pq->ptgh->guest_need_kick = onoff;
+		pq->atok->appl_need_kick = onoff;
 	}
 }
 
@@ -1358,150 +1338,6 @@ ptnet_rx_intr(void *opaque)
 	ptnet_rx_eof(pq, PTNET_RX_BUDGET, true);
 }
 
-/* The following offloadings-related functions are taken from the vtnet
- * driver, but the same functionality is required for the ptnet driver.
- * As a temporary solution, I copied this code from vtnet and I started
- * to generalize it (taking away driver-specific statistic accounting),
- * making as little modifications as possible.
- * In the future we need to share these functions between vtnet and ptnet.
- */
-static int
-ptnet_tx_offload_ctx(struct mbuf *m, int *etype, int *proto, int *start)
-{
-	struct ether_vlan_header *evh;
-	int offset;
-
-	evh = mtod(m, struct ether_vlan_header *);
-	if (evh->evl_encap_proto == htons(ETHERTYPE_VLAN)) {
-		/* BMV: We should handle nested VLAN tags too. */
-		*etype = ntohs(evh->evl_proto);
-		offset = sizeof(struct ether_vlan_header);
-	} else {
-		*etype = ntohs(evh->evl_encap_proto);
-		offset = sizeof(struct ether_header);
-	}
-
-	switch (*etype) {
-#if defined(INET)
-	case ETHERTYPE_IP: {
-		struct ip *ip, iphdr;
-		if (__predict_false(m->m_len < offset + sizeof(struct ip))) {
-			m_copydata(m, offset, sizeof(struct ip),
-			    (caddr_t) &iphdr);
-			ip = &iphdr;
-		} else
-			ip = (struct ip *)(m->m_data + offset);
-		*proto = ip->ip_p;
-		*start = offset + (ip->ip_hl << 2);
-		break;
-	}
-#endif
-#if defined(INET6)
-	case ETHERTYPE_IPV6:
-		*proto = -1;
-		*start = ip6_lasthdr(m, offset, IPPROTO_IPV6, proto);
-		/* Assert the network stack sent us a valid packet. */
-		KASSERT(*start > offset,
-		    ("%s: mbuf %p start %d offset %d proto %d", __func__, m,
-		    *start, offset, *proto));
-		break;
-#endif
-	default:
-		/* Here we should increment the tx_csum_bad_ethtype counter. */
-		return (EINVAL);
-	}
-
-	return (0);
-}
-
-static int
-ptnet_tx_offload_tso(if_t ifp, struct mbuf *m, int eth_type,
-		     int offset, bool allow_ecn, struct virtio_net_hdr *hdr)
-{
-	static struct timeval lastecn;
-	static int curecn;
-	struct tcphdr *tcp, tcphdr;
-
-	if (__predict_false(m->m_len < offset + sizeof(struct tcphdr))) {
-		m_copydata(m, offset, sizeof(struct tcphdr), (caddr_t) &tcphdr);
-		tcp = &tcphdr;
-	} else
-		tcp = (struct tcphdr *)(m->m_data + offset);
-
-	hdr->hdr_len = offset + (tcp->th_off << 2);
-	hdr->gso_size = m->m_pkthdr.tso_segsz;
-	hdr->gso_type = eth_type == ETHERTYPE_IP ? VIRTIO_NET_HDR_GSO_TCPV4 :
-	    VIRTIO_NET_HDR_GSO_TCPV6;
-
-	if (tcp->th_flags & TH_CWR) {
-		/*
-		 * Drop if VIRTIO_NET_F_HOST_ECN was not negotiated. In FreeBSD,
-		 * ECN support is not on a per-interface basis, but globally via
-		 * the net.inet.tcp.ecn.enable sysctl knob. The default is off.
-		 */
-		if (!allow_ecn) {
-			if (ppsratecheck(&lastecn, &curecn, 1))
-				if_printf(ifp,
-				    "TSO with ECN not negotiated with host\n");
-			return (ENOTSUP);
-		}
-		hdr->gso_type |= VIRTIO_NET_HDR_GSO_ECN;
-	}
-
-	/* Here we should increment tx_tso counter. */
-
-	return (0);
-}
-
-static struct mbuf *
-ptnet_tx_offload(if_t ifp, struct mbuf *m, bool allow_ecn,
-		 struct virtio_net_hdr *hdr)
-{
-	int flags, etype, csum_start, proto, error;
-
-	flags = m->m_pkthdr.csum_flags;
-
-	error = ptnet_tx_offload_ctx(m, &etype, &proto, &csum_start);
-	if (error)
-		goto drop;
-
-	if ((etype == ETHERTYPE_IP && flags & PTNET_CSUM_OFFLOAD) ||
-	    (etype == ETHERTYPE_IPV6 && flags & PTNET_CSUM_OFFLOAD_IPV6)) {
-		/*
-		 * We could compare the IP protocol vs the CSUM_ flag too,
-		 * but that really should not be necessary.
-		 */
-		hdr->flags |= VIRTIO_NET_HDR_F_NEEDS_CSUM;
-		hdr->csum_start = csum_start;
-		hdr->csum_offset = m->m_pkthdr.csum_data;
-		/* Here we should increment the tx_csum counter. */
-	}
-
-	if (flags & CSUM_TSO) {
-		if (__predict_false(proto != IPPROTO_TCP)) {
-			/* Likely failed to correctly parse the mbuf.
-			 * Here we should increment the tx_tso_not_tcp
-			 * counter. */
-			goto drop;
-		}
-
-		KASSERT(hdr->flags & VIRTIO_NET_HDR_F_NEEDS_CSUM,
-		    ("%s: mbuf %p TSO without checksum offload %#x",
-		    __func__, m, flags));
-
-		error = ptnet_tx_offload_tso(ifp, m, etype, csum_start,
-					     allow_ecn, hdr);
-		if (error)
-			goto drop;
-	}
-
-	return (m);
-
-drop:
-	m_freem(m);
-	return (NULL);
-}
-
 static void
 ptnet_vlan_tag_remove(struct mbuf *m)
 {
@@ -1517,184 +1353,13 @@ ptnet_vlan_tag_remove(struct mbuf *m)
 	m_adj(m, ETHER_VLAN_ENCAP_LEN);
 }
 
-/*
- * Use the checksum offset in the VirtIO header to set the
- * correct CSUM_* flags.
- */
-static int
-ptnet_rx_csum_by_offset(struct mbuf *m, uint16_t eth_type, int ip_start,
-			struct virtio_net_hdr *hdr)
-{
-#if defined(INET) || defined(INET6)
-	int offset = hdr->csum_start + hdr->csum_offset;
-#endif
-
-	/* Only do a basic sanity check on the offset. */
-	switch (eth_type) {
-#if defined(INET)
-	case ETHERTYPE_IP:
-		if (__predict_false(offset < ip_start + sizeof(struct ip)))
-			return (1);
-		break;
-#endif
-#if defined(INET6)
-	case ETHERTYPE_IPV6:
-		if (__predict_false(offset < ip_start + sizeof(struct ip6_hdr)))
-			return (1);
-		break;
-#endif
-	default:
-		/* Here we should increment the rx_csum_bad_ethtype counter. */
-		return (1);
-	}
-
-	/*
-	 * Use the offset to determine the appropriate CSUM_* flags. This is
-	 * a bit dirty, but we can get by with it since the checksum offsets
-	 * happen to be different. We assume the host host does not do IPv4
-	 * header checksum offloading.
-	 */
-	switch (hdr->csum_offset) {
-	case offsetof(struct udphdr, uh_sum):
-	case offsetof(struct tcphdr, th_sum):
-		m->m_pkthdr.csum_flags |= CSUM_DATA_VALID | CSUM_PSEUDO_HDR;
-		m->m_pkthdr.csum_data = 0xFFFF;
-		break;
-	case offsetof(struct sctphdr, checksum):
-		m->m_pkthdr.csum_flags |= CSUM_SCTP_VALID;
-		break;
-	default:
-		/* Here we should increment the rx_csum_bad_offset counter. */
-		return (1);
-	}
-
-	return (0);
-}
-
-static int
-ptnet_rx_csum_by_parse(struct mbuf *m, uint16_t eth_type, int ip_start,
-		       struct virtio_net_hdr *hdr)
-{
-	int offset, proto;
-
-	switch (eth_type) {
-#if defined(INET)
-	case ETHERTYPE_IP: {
-		struct ip *ip;
-		if (__predict_false(m->m_len < ip_start + sizeof(struct ip)))
-			return (1);
-		ip = (struct ip *)(m->m_data + ip_start);
-		proto = ip->ip_p;
-		offset = ip_start + (ip->ip_hl << 2);
-		break;
-	}
-#endif
-#if defined(INET6)
-	case ETHERTYPE_IPV6:
-		if (__predict_false(m->m_len < ip_start +
-		    sizeof(struct ip6_hdr)))
-			return (1);
-		offset = ip6_lasthdr(m, ip_start, IPPROTO_IPV6, &proto);
-		if (__predict_false(offset < 0))
-			return (1);
-		break;
-#endif
-	default:
-		/* Here we should increment the rx_csum_bad_ethtype counter. */
-		return (1);
-	}
-
-	switch (proto) {
-	case IPPROTO_TCP:
-		if (__predict_false(m->m_len < offset + sizeof(struct tcphdr)))
-			return (1);
-		m->m_pkthdr.csum_flags |= CSUM_DATA_VALID | CSUM_PSEUDO_HDR;
-		m->m_pkthdr.csum_data = 0xFFFF;
-		break;
-	case IPPROTO_UDP:
-		if (__predict_false(m->m_len < offset + sizeof(struct udphdr)))
-			return (1);
-		m->m_pkthdr.csum_flags |= CSUM_DATA_VALID | CSUM_PSEUDO_HDR;
-		m->m_pkthdr.csum_data = 0xFFFF;
-		break;
-	case IPPROTO_SCTP:
-		if (__predict_false(m->m_len < offset + sizeof(struct sctphdr)))
-			return (1);
-		m->m_pkthdr.csum_flags |= CSUM_SCTP_VALID;
-		break;
-	default:
-		/*
-		 * For the remaining protocols, FreeBSD does not support
-		 * checksum offloading, so the checksum will be recomputed.
-		 */
-#if 0
-		if_printf(ifp, "cksum offload of unsupported "
-		    "protocol eth_type=%#x proto=%d csum_start=%d "
-		    "csum_offset=%d\n", __func__, eth_type, proto,
-		    hdr->csum_start, hdr->csum_offset);
-#endif
-		break;
-	}
-
-	return (0);
-}
-
-/*
- * Set the appropriate CSUM_* flags. Unfortunately, the information
- * provided is not directly useful to us. The VirtIO header gives the
- * offset of the checksum, which is all Linux needs, but this is not
- * how FreeBSD does things. We are forced to peek inside the packet
- * a bit.
- *
- * It would be nice if VirtIO gave us the L4 protocol or if FreeBSD
- * could accept the offsets and let the stack figure it out.
- */
-static int
-ptnet_rx_csum(struct mbuf *m, struct virtio_net_hdr *hdr)
-{
-	struct ether_header *eh;
-	struct ether_vlan_header *evh;
-	uint16_t eth_type;
-	int offset, error;
-
-	eh = mtod(m, struct ether_header *);
-	eth_type = ntohs(eh->ether_type);
-	if (eth_type == ETHERTYPE_VLAN) {
-		/* BMV: We should handle nested VLAN tags too. */
-		evh = mtod(m, struct ether_vlan_header *);
-		eth_type = ntohs(evh->evl_proto);
-		offset = sizeof(struct ether_vlan_header);
-	} else
-		offset = sizeof(struct ether_header);
-
-	if (hdr->flags & VIRTIO_NET_HDR_F_NEEDS_CSUM)
-		error = ptnet_rx_csum_by_offset(m, eth_type, offset, hdr);
-	else
-		error = ptnet_rx_csum_by_parse(m, eth_type, offset, hdr);
-
-	return (error);
-}
-/* End of offloading-related functions to be shared with vtnet. */
-
-static inline void
-ptnet_sync_tail(struct ptnet_csb_hg *pthg, struct netmap_kring *kring)
-{
-	struct netmap_ring *ring = kring->ring;
-
-	/* Update hwcur and hwtail as known by the host. */
-        ptnetmap_guest_read_kring_csb(pthg, kring);
-
-	/* nm_sync_finalize */
-	ring->tail = kring->rtail = kring->nr_hwtail;
-}
-
 static void
 ptnet_ring_update(struct ptnet_queue *pq, struct netmap_kring *kring,
 		  unsigned int head, unsigned int sync_flags)
 {
 	struct netmap_ring *ring = kring->ring;
-	struct ptnet_csb_gh *ptgh = pq->ptgh;
-	struct ptnet_csb_hg *pthg = pq->pthg;
+	struct nm_csb_atok *atok = pq->atok;
+	struct nm_csb_ktoa *ktoa = pq->ktoa;
 
 	/* Some packets have been pushed to the netmap ring. We have
 	 * to tell the host to process the new packets, updating cur
@@ -1704,11 +1369,11 @@ ptnet_ring_update(struct ptnet_queue *pq, struct netmap_kring *kring,
 	/* Mimic nm_txsync_prologue/nm_rxsync_prologue. */
 	kring->rcur = kring->rhead = head;
 
-	ptnetmap_guest_write_kring_csb(ptgh, kring->rcur, kring->rhead);
+	nm_sync_kloop_appl_write(atok, kring->rcur, kring->rhead);
 
 	/* Kick the host if needed. */
-	if (NM_ACCESS_ONCE(pthg->host_need_kick)) {
-		ptgh->sync_flags = sync_flags;
+	if (NM_ACCESS_ONCE(ktoa->kern_need_kick)) {
+		atok->sync_flags = sync_flags;
 		ptnet_kick(pq);
 	}
 }
@@ -1728,8 +1393,8 @@ ptnet_drain_transmit_queue(struct ptnet_queue *pq, unsigned int budget,
 	struct netmap_adapter *na = &sc->ptna->dr.up;
 	if_t ifp = sc->ifp;
 	unsigned int batch_count = 0;
-	struct ptnet_csb_gh *ptgh;
-	struct ptnet_csb_hg *pthg;
+	struct nm_csb_atok *atok;
+	struct nm_csb_ktoa *ktoa;
 	struct netmap_kring *kring;
 	struct netmap_ring *ring;
 	struct netmap_slot *slot;
@@ -1744,7 +1409,7 @@ ptnet_drain_transmit_queue(struct ptnet_queue *pq, unsigned int budget,
 
 	if (!PTNET_Q_TRYLOCK(pq)) {
 		/* We failed to acquire the lock, schedule the taskqueue. */
-		RD(1, "Deferring TX work");
+		nm_prlim(1, "Deferring TX work");
 		if (may_resched) {
 			taskqueue_enqueue(pq->taskq, &pq->task);
 		}
@@ -1754,12 +1419,12 @@ ptnet_drain_transmit_queue(struct ptnet_queue *pq, unsigned int budget,
 
 	if (unlikely(!(ifp->if_drv_flags & IFF_DRV_RUNNING))) {
 		PTNET_Q_UNLOCK(pq);
-		RD(1, "Interface is down");
+		nm_prlim(1, "Interface is down");
 		return ENETDOWN;
 	}
 
-	ptgh = pq->ptgh;
-	pthg = pq->pthg;
+	atok = pq->atok;
+	ktoa = pq->ktoa;
 	kring = na->tx_rings[pq->kring_id];
 	ring = kring->ring;
 	lim = kring->nkr_num_slots - 1;
@@ -1771,26 +1436,31 @@ ptnet_drain_transmit_queue(struct ptnet_queue *pq, unsigned int budget,
 			/* We ran out of slot, let's see if the host has
 			 * freed up some, by reading hwcur and hwtail from
 			 * the CSB. */
-			ptnet_sync_tail(pthg, kring);
+			ptnet_sync_tail(ktoa, kring);
 
 			if (PTNET_TX_NOSPACE(head, kring, minspace)) {
 				/* Still no slots available. Reactivate the
 				 * interrupts so that we can be notified
 				 * when some free slots are made available by
 				 * the host. */
-				ptgh->guest_need_kick = 1;
+				atok->appl_need_kick = 1;
 
-				/* Double-check. */
-				ptnet_sync_tail(pthg, kring);
+				/* Double check. We need a full barrier to
+				 * prevent the store to atok->appl_need_kick
+				 * to be reordered with the load from
+				 * ktoa->hwcur and ktoa->hwtail (store-load
+				 * barrier). */
+				nm_stld_barrier();
+				ptnet_sync_tail(ktoa, kring);
 				if (likely(PTNET_TX_NOSPACE(head, kring,
 							    minspace))) {
 					break;
 				}
 
-				RD(1, "Found more slots by doublecheck");
+				nm_prlim(1, "Found more slots by doublecheck");
 				/* More slots were freed before reactivating
 				 * the interrupts. */
-				ptgh->guest_need_kick = 0;
+				atok->appl_need_kick = 0;
 			}
 		}
 
@@ -1814,7 +1484,7 @@ ptnet_drain_transmit_queue(struct ptnet_queue *pq, unsigned int budget,
 			 * two 8-bytes-wide writes. */
 			memset(nmbuf, 0, PTNET_HDR_SIZE);
 			if (mhead->m_pkthdr.csum_flags & PTNET_ALL_OFFLOAD) {
-				mhead = ptnet_tx_offload(ifp, mhead, false,
+				mhead = virtio_net_tx_offload(ifp, mhead, false,
 							 vh);
 				if (unlikely(!mhead)) {
 					/* Packet dropped because errors
@@ -1826,7 +1496,7 @@ ptnet_drain_transmit_queue(struct ptnet_queue *pq, unsigned int budget,
 					continue;
 				}
 			}
-			ND(1, "%s: [csum_flags %lX] vnet hdr: flags %x "
+			nm_prdis(1, "%s: [csum_flags %lX] vnet hdr: flags %x "
 			      "csum_start %u csum_ofs %u hdr_len = %u "
 			      "gso_size %u gso_type %x", __func__,
 			      mhead->m_pkthdr.csum_flags, vh->flags,
@@ -1901,7 +1571,7 @@ ptnet_drain_transmit_queue(struct ptnet_queue *pq, unsigned int budget,
 	}
 
 	if (count >= budget && may_resched) {
-		DBG(RD(1, "out of budget: resched, %d mbufs pending\n",
+		DBG(nm_prlim(1, "out of budget: resched, %d mbufs pending\n",
 					drbr_inuse(ifp, pq->bufring)));
 		taskqueue_enqueue(pq->taskq, &pq->task);
 	}
@@ -1943,7 +1613,7 @@ ptnet_transmit(if_t ifp, struct mbuf *m)
 	err = drbr_enqueue(ifp, pq->bufring, m);
 	if (err) {
 		/* ENOBUFS when the bufring is full */
-		RD(1, "%s: drbr_enqueue() failed %d\n",
+		nm_prlim(1, "%s: drbr_enqueue() failed %d\n",
 			__func__, err);
 		pq->stats.errors ++;
 		return err;
@@ -2020,8 +1690,8 @@ ptnet_rx_eof(struct ptnet_queue *pq, unsigned int budget, bool may_resched)
 {
 	struct ptnet_softc *sc = pq->sc;
 	bool have_vnet_hdr = sc->vnet_hdr_len;
-	struct ptnet_csb_gh *ptgh = pq->ptgh;
-	struct ptnet_csb_hg *pthg = pq->pthg;
+	struct nm_csb_atok *atok = pq->atok;
+	struct nm_csb_ktoa *ktoa = pq->ktoa;
 	struct netmap_adapter *na = &sc->ptna->dr.up;
 	struct netmap_kring *kring = na->rx_rings[pq->kring_id];
 	struct netmap_ring *ring = kring->ring;
@@ -2053,21 +1723,26 @@ host_sync:
 			/* We ran out of slot, let's see if the host has
 			 * added some, by reading hwcur and hwtail from
 			 * the CSB. */
-			ptnet_sync_tail(pthg, kring);
+			ptnet_sync_tail(ktoa, kring);
 
 			if (head == ring->tail) {
 				/* Still no slots available. Reactivate
 				 * interrupts as they were disabled by the
 				 * host thread right before issuing the
 				 * last interrupt. */
-				ptgh->guest_need_kick = 1;
+				atok->appl_need_kick = 1;
 
-				/* Double-check. */
-				ptnet_sync_tail(pthg, kring);
+				/* Double check for more completed RX slots.
+				 * We need a full barrier to prevent the store
+				 * to atok->appl_need_kick to be reordered with
+				 * the load from ktoa->hwcur and ktoa->hwtail
+				 * (store-load barrier). */
+				nm_stld_barrier();
+				ptnet_sync_tail(ktoa, kring);
 				if (likely(head == ring->tail)) {
 					break;
 				}
-				ptgh->guest_need_kick = 0;
+				atok->appl_need_kick = 0;
 			}
 		}
 
@@ -2083,13 +1758,13 @@ host_sync:
 				/* There is no good reason why host should
 				 * put the header in multiple netmap slots.
 				 * If this is the case, discard. */
-				RD(1, "Fragmented vnet-hdr: dropping");
+				nm_prlim(1, "Fragmented vnet-hdr: dropping");
 				head = ptnet_rx_discard(kring, head);
 				pq->stats.iqdrops ++;
 				deliver = 0;
 				goto skip;
 			}
-			ND(1, "%s: vnet hdr: flags %x csum_start %u "
+			nm_prdis(1, "%s: vnet hdr: flags %x csum_start %u "
 			      "csum_ofs %u hdr_len = %u gso_size %u "
 			      "gso_type %x", __func__, vh->flags,
 			      vh->csum_start, vh->csum_offset, vh->hdr_len,
@@ -2153,7 +1828,7 @@ host_sync:
 				/* The very last slot prepared by the host has
 				 * the NS_MOREFRAG set. Drop it and continue
 				 * the outer cycle (to do the double-check). */
-				RD(1, "Incomplete packet: dropping");
+				nm_prlim(1, "Incomplete packet: dropping");
 				m_freem(mhead);
 				pq->stats.iqdrops ++;
 				goto host_sync;
@@ -2187,14 +1862,11 @@ host_sync:
 			}
 		}
 
-		if (have_vnet_hdr && (vh->flags & (VIRTIO_NET_HDR_F_NEEDS_CSUM
-					| VIRTIO_NET_HDR_F_DATA_VALID))) {
-			if (unlikely(ptnet_rx_csum(mhead, vh))) {
-				m_freem(mhead);
-				RD(1, "Csum offload error: dropping");
-				pq->stats.iqdrops ++;
-				deliver = 0;
-			}
+		if (unlikely(have_vnet_hdr && virtio_net_rx_csum(mhead, vh))) {
+			m_freem(mhead);
+			nm_prlim(1, "Csum offload error: dropping");
+			pq->stats.iqdrops ++;
+			deliver = 0;
 		}
 
 skip:
@@ -2237,7 +1909,7 @@ escape:
 	if (count >= budget && may_resched) {
 		/* If we ran out of budget or the double-check found new
 		 * slots to process, schedule the taskqueue. */
-		DBG(RD(1, "out of budget: resched h %u t %u\n",
+		DBG(nm_prlim(1, "out of budget: resched h %u t %u\n",
 					head, ring->tail));
 		taskqueue_enqueue(pq->taskq, &pq->task);
 	}
@@ -2252,7 +1924,7 @@ ptnet_rx_task(void *context, int pending)
 {
 	struct ptnet_queue *pq = context;
 
-	DBG(RD(1, "%s: pq #%u\n", __func__, pq->kring_id));
+	DBG(nm_prlim(1, "%s: pq #%u\n", __func__, pq->kring_id));
 	ptnet_rx_eof(pq, PTNET_RX_BUDGET, true);
 }
 
@@ -2261,7 +1933,7 @@ ptnet_tx_task(void *context, int pending)
 {
 	struct ptnet_queue *pq = context;
 
-	DBG(RD(1, "%s: pq #%u\n", __func__, pq->kring_id));
+	DBG(nm_prlim(1, "%s: pq #%u\n", __func__, pq->kring_id));
 	ptnet_drain_transmit_queue(pq, PTNET_TX_BUDGET, true);
 }
 
@@ -2279,7 +1951,7 @@ ptnet_poll(if_t ifp, enum poll_cmd cmd, int budget)
 
 	KASSERT(sc->num_rings > 0, ("Found no queues in while polling ptnet"));
 	queue_budget = MAX(budget / sc->num_rings, 1);
-	RD(1, "Per-queue budget is %d", queue_budget);
+	nm_prlim(1, "Per-queue budget is %d", queue_budget);
 
 	while (budget) {
 		unsigned int rcnt = 0;
@@ -2324,3 +1996,4 @@ ptnet_poll(if_t ifp, enum poll_cmd cmd, int budget)
 	return count;
 }
 #endif /* DEVICE_POLLING */
+#endif /* WITH_PTNETMAP */

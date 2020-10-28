@@ -1,16 +1,19 @@
 diff --git a/igb/Makefile b/igb/Makefile
-index 02d49bb..47fd630 100644
+index 02d49bb..1267d14 100644
 --- a/igb/Makefile
 +++ b/igb/Makefile
-@@ -28,7 +28,7 @@ ifneq ($(KERNELRELEASE),)
+@@ -28,9 +28,9 @@ ifneq ($(KERNELRELEASE),)
  # Makefile for the Intel(R) Gigabit Ethernet Linux Driver
  #
  
 -obj-$(CONFIG_IGB) += igb.o
 +obj-$(CONFIG_IGB) += igb$(NETMAP_DRIVER_SUFFIX).o
  
- define igb-y
+-define igb-y
++define igb$(NETMAP_DRIVER_SUFFIX)-y
  	igb_main.o
+ 	e1000_api.o
+ 	igb_ethtool.o
 @@ -46,19 +46,19 @@ define igb-y
  	e1000_82575.o
  	e1000_i210.o
@@ -47,20 +50,20 @@ index 02d49bb..47fd630 100644
  manfile:
  	@gzip -c ../${DRIVER}.${MANSECTION} > ${DRIVER}.${MANSECTION}.gz
 diff --git a/igb/igb_main.c b/igb/igb_main.c
-index b98cfa6..13b17ea 100644
+index b98cfa6..928cb8e 100644
 --- a/igb/igb_main.c
 +++ b/igb/igb_main.c
-@@ -317,6 +317,10 @@ static int debug = NETIF_MSG_DRV | NETIF_MSG_PROBE;
- module_param(debug, int, 0);
- MODULE_PARM_DESC(debug, "Debug level (0=none, ..., 16=all)");
+@@ -258,6 +258,10 @@ static struct pci_error_handlers igb_err_handler = {
+ static void igb_init_fw(struct igb_adapter *adapter);
+ static void igb_init_dmac(struct igb_adapter *adapter, u32 pba);
  
 +#if defined(CONFIG_NETMAP) || defined(CONFIG_NETMAP_MODULE)
 +#include <if_igb_netmap.h>
 +#endif
 +
- /**
-  * igb_init_module - Driver Registration Routine
-  *
+ static struct pci_driver igb_driver = {
+ 	.name     = igb_driver_name,
+ 	.id_table = igb_pci_tbl,
 @@ -3073,6 +3077,10 @@ static int igb_probe(struct pci_dev *pdev,
  	/* carrier off reporting is important to ethtool even BEFORE open */
  	netif_carrier_off(netdev);
