@@ -1,6 +1,10 @@
 #ifndef CTRS_H_
 #define CTRS_H_
 
+/* $FreeBSD$ */
+
+#include <errno.h>
+#include <stdlib.h>
 #include <sys/time.h>
 
 /* counters to accumulate statistics */
@@ -16,12 +20,12 @@ struct my_ctrs {
  * Caller has to make sure that the buffer is large enough.
  */
 static const char *
-norm2(char *buf, double val, char *fmt, int normalize)
+norm2(char *buf, double val, const char *fmt, int normalize)
 {
-	char *units[] = { "", "K", "M", "G", "T" };
+	const char *units[] = { "", "K", "M", "G", "T" };
 	u_int i;
 	if (normalize)
-		for (i = 0; val >=1000 && i < sizeof(units)/sizeof(char *) - 1; i++)
+		for (i = 0; val >=1000 && i < sizeof(units)/sizeof(const char *) - 1; i++)
 			val /= 1000;
 	else
 		i=0;

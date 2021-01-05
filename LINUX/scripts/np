@@ -371,22 +371,24 @@ function build-prep()
 	get-params "version" "$@"
 
 	local dst=$(get-kernel $version)
+	local last
 
 	[ -f $dst/.build-prep ] && { echo $dst; return; }
 
 	(
 		cd $dst
-		[ -e include/linux/compiler-gcc5.h ] ||
-			ln -s compiler-gcc4.h include/linux/compiler-gcc5.h
-		[ -e include/linux/compiler-gcc6.h ] ||
-			ln -s compiler-gcc5.h include/linux/compiler-gcc6.h
-		[ -e include/linux/compiler-gcc7.h ] ||
-			ln -s compiler-gcc6.h include/linux/compiler-gcc7.h
-		# force disabling PIE
+		last=compiler-gcc.h
+		for i in $(seq 9); do
+			[ -e include/linux/compiler-gcc$i.h ] ||
+				ln -s $last include/linux/compiler-gcc$i.h
+			last=compiler-gcc$i.h
+		done
+		# force disabling PIE and fcf-protection
 		sed -i -e '/^all: vmlinux/a\
 \
 KBUILD_CFLAGS += $(call cc-option, -fno-pie)\
 KBUILD_CFLAGS += $(call cc-option, -no-pie)\
+KBUILD_CFLAGS += $(call cc-option, -fcf-protection=none)\
 KBUILD_AFLAGS += $(call cc-option, -fno-pie)\
 KBUILD_CPPFLAGS += $(call cc-option, -fno-pie)' Makefile
 		if [ -f $LINUX_CONFIGS/config-$version ]; then
@@ -395,6 +397,11 @@ KBUILD_CPPFLAGS += $(call cc-option, -fno-pie)' Makefile
 		else
 			make allmodconfig
 		fi
+		# old kernels' selinux causes compilation failures with gcc >= 9
+		echo "CONFIG_SECURITY_SELINUX=n" >> .config
+		yes '' | make oldconfig
+		# some tools do not compile with -Werror and gcc >= 9
+		sed -i 's/-Werror/-Wno-error/g' $(grep -Rl -- -Werror tools)
 		make modules_prepare
 		touch .build-prep
 	) >$dst.log 2>&1 || error "build-prep failed for linux $version. Please check $dst.log"
@@ -420,7 +427,7 @@ function check-patch()
 	# extract the driver name
 	local driver=$(scripts/vers $_patch -s -p -p)
 	# possibly extract the selected driver version
-	driver_version=${driver#*:}
+	driver_version=$(echo "$driver" | sed -n 's/^.*://p')
 	driver=${driver%%:*}
 	# extract the driver type (vanilla or external)
 	local dtype=$(scripts/vers $_patch -s -p -p -p)
@@ -502,7 +509,7 @@ function check-patch()
 			(make get-$driver && make -j $PARALLEL_MAKE) >>$log 2>&1 && ok=true
 			grep -q warning: $log && { warn=true; echo $warn > $cwarn; }
 			cat config.log >>$log
-			cat netmap_linux_config.h >>$log
+			cat netmap_linux_config.h >>$log 2>/dev/null
 			popd >/dev/null
 			cp $log $clog
 		fi
