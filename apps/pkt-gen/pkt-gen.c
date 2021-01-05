@@ -38,40 +38,38 @@
  */
 
 #define _GNU_SOURCE	/* for CPU_SET() */
-#include <stdio.h>
-#include <libnetmap.h>
-
-
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <ctype.h>	// isprint()
-#include <string.h>
-#include <unistd.h>	// sysconf()
-#include <sys/poll.h>
-#include <sys/ioctl.h>
-#include <signal.h>
 #include <arpa/inet.h>	/* ntohs */
-#if !defined(_WIN32) && !defined(linux)
-#include <sys/sysctl.h>	/* sysctl */
-#endif
+#include <assert.h>
+#include <ctype.h>	// isprint()
+#include <errno.h>
+#include <fcntl.h>
 #include <ifaddrs.h>	/* getifaddrs */
+#include <libnetmap.h>
+#include <math.h>
 #include <net/ethernet.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
-#include <netinet/udp.h>
 #include <netinet/ip6.h>
+#include <netinet/udp.h>
+#ifndef NO_PCAP
+#include <pcap/pcap.h>
+#endif
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/poll.h>
+#include <sys/stat.h>
+#if !defined(_WIN32) && !defined(linux)
+#include <sys/sysctl.h>	/* sysctl */
+#endif
+#include <sys/types.h>
+#include <unistd.h>	// sysconf()
 #ifdef linux
 #define IPV6_VERSION	0x60
 #define IPV6_DEFHLIM	64
-#endif
-#include <assert.h>
-#include <math.h>
-
-#include <pthread.h>
-
-#ifndef NO_PCAP
-#include <pcap/pcap.h>
 #endif
 
 #include "ctrs.h"
@@ -804,6 +802,25 @@ dump_payload(const char *_p, int len, struct netmap_ring *ring, int cur)
 #define uh_sum check
 #endif /* linux */
 
+static uint16_t
+new_ip_sum(uint16_t ip_sum, uint32_t oaddr, uint32_t naddr)
+{
+	ip_sum = cksum_add(ip_sum, ~oaddr >> 16);
+	ip_sum = cksum_add(ip_sum, ~oaddr & 0xffff);
+	ip_sum = cksum_add(ip_sum, naddr >> 16);
+	ip_sum = cksum_add(ip_sum, naddr & 0xffff);
+	return ip_sum;
+}
+
+static uint16_t
+new_udp_sum(uint16_t udp_sum, uint16_t oport, uint16_t nport)
+{
+	udp_sum = cksum_add(udp_sum, ~oport);
+	udp_sum = cksum_add(udp_sum, nport);
+	return udp_sum;
+}
+
+
 static void
 update_ip(struct pkt *pkt, struct targ *t)
 {
@@ -812,7 +829,7 @@ update_ip(struct pkt *pkt, struct targ *t)
 	struct udphdr udp;
 	uint32_t oaddr, naddr;
 	uint16_t oport, nport;
-	uint16_t ip_sum, udp_sum;
+	uint16_t ip_sum = 0, udp_sum = 0;
 
 	memcpy(&ip, &pkt->ipv4.ip, sizeof(ip));
 	memcpy(&udp, &pkt->ipv4.udp, sizeof(udp));
@@ -825,35 +842,28 @@ update_ip(struct pkt *pkt, struct targ *t)
 			udp.uh_sport = nrand48(t->seed);
 			naddr = ntohl(ip.ip_src.s_addr);
 			nport = ntohs(udp.uh_sport);
-			break;
-		}
-		if (oport < g->src_ip.port1) {
-			nport = oport + 1;
+			ip_sum = new_ip_sum(ip_sum, oaddr, naddr);
+			udp_sum = new_udp_sum(udp_sum, oport, nport);
+		} else {
+			if (oport < g->src_ip.port1) {
+				nport = oport + 1;
+				udp.uh_sport = htons(nport);
+				udp_sum = new_udp_sum(udp_sum, oport, nport);
+				break;
+			}
+			nport = g->src_ip.port0;
 			udp.uh_sport = htons(nport);
-			break;
-		}
-		nport = g->src_ip.port0;
-		udp.uh_sport = htons(nport);
-		if (oaddr < g->src_ip.ipv4.end) {
-			naddr = oaddr + 1;
+			if (oaddr < g->src_ip.ipv4.end) {
+				naddr = oaddr + 1;
+				ip.ip_src.s_addr = htonl(naddr);
+				ip_sum = new_ip_sum(ip_sum, oaddr, naddr);
+				break;
+			}
+			naddr = g->src_ip.ipv4.start;
 			ip.ip_src.s_addr = htonl(naddr);
-			break;
+			ip_sum = new_ip_sum(ip_sum, oaddr, naddr);
 		}
-		naddr = g->src_ip.ipv4.start;
-		ip.ip_src.s_addr = htonl(naddr);
-	} while (0);
-	/* update checksums if needed */
-	if (oaddr != naddr) {
-		ip_sum = cksum_add(ip_sum, ~oaddr >> 16);
-		ip_sum = cksum_add(ip_sum, ~oaddr & 0xffff);
-		ip_sum = cksum_add(ip_sum, naddr >> 16);
-		ip_sum = cksum_add(ip_sum, naddr & 0xffff);
-	}
-	if (oport != nport) {
-		udp_sum = cksum_add(udp_sum, ~oport);
-		udp_sum = cksum_add(udp_sum, nport);
-	}
-	do {
+
 		naddr = oaddr = ntohl(ip.ip_dst.s_addr);
 		nport = oport = ntohs(udp.uh_dport);
 		if (g->options & OPT_RANDOM_DST) {
@@ -861,34 +871,29 @@ update_ip(struct pkt *pkt, struct targ *t)
 			udp.uh_dport = nrand48(t->seed);
 			naddr = ntohl(ip.ip_dst.s_addr);
 			nport = ntohs(udp.uh_dport);
-			break;
-		}
-		if (oport < g->dst_ip.port1) {
-			nport = oport + 1;
+			ip_sum = new_ip_sum(ip_sum, oaddr, naddr);
+			udp_sum = new_udp_sum(udp_sum, oport, nport);
+		} else {
+			if (oport < g->dst_ip.port1) {
+				nport = oport + 1;
+				udp.uh_dport = htons(nport);
+				udp_sum = new_udp_sum(udp_sum, oport, nport);
+				break;
+			}
+			nport = g->dst_ip.port0;
 			udp.uh_dport = htons(nport);
-			break;
-		}
-		nport = g->dst_ip.port0;
-		udp.uh_dport = htons(nport);
-		if (oaddr < g->dst_ip.ipv4.end) {
-			naddr = oaddr + 1;
+			if (oaddr < g->dst_ip.ipv4.end) {
+				naddr = oaddr + 1;
+				ip.ip_dst.s_addr = htonl(naddr);
+				ip_sum = new_ip_sum(ip_sum, oaddr, naddr);
+				break;
+			}
+			naddr = g->dst_ip.ipv4.start;
 			ip.ip_dst.s_addr = htonl(naddr);
-			break;
+			ip_sum = new_ip_sum(ip_sum, oaddr, naddr);
 		}
-		naddr = g->dst_ip.ipv4.start;
-		ip.ip_dst.s_addr = htonl(naddr);
 	} while (0);
 	/* update checksums */
-	if (oaddr != naddr) {
-		ip_sum = cksum_add(ip_sum, ~oaddr >> 16);
-		ip_sum = cksum_add(ip_sum, ~oaddr & 0xffff);
-		ip_sum = cksum_add(ip_sum, naddr >> 16);
-		ip_sum = cksum_add(ip_sum, naddr & 0xffff);
-	}
-	if (oport != nport) {
-		udp_sum = cksum_add(udp_sum, ~oport);
-		udp_sum = cksum_add(udp_sum, nport);
-	}
 	if (udp_sum != 0)
 		udp.uh_sum = ~cksum_add(~udp.uh_sum, htons(udp_sum));
 	if (ip_sum != 0) {
@@ -941,14 +946,14 @@ update_ip6(struct pkt *pkt, struct targ *t)
 		}
 		naddr = ntohs(g->src_ip.ipv6.start.s6_addr16[group]);
 		ip6.ip6_src.s6_addr16[group] = htons(naddr);
-	} while (0);
-	/* update checksums if needed */
-	if (oaddr != naddr)
-		udp_sum = cksum_add(~oaddr, naddr);
-	if (oport != nport)
-		udp_sum = cksum_add(udp_sum,
-		    cksum_add(~oport, nport));
-	do {
+
+		/* update checksums if needed */
+		if (oaddr != naddr)
+			udp_sum = cksum_add(~oaddr, naddr);
+		if (oport != nport)
+			udp_sum = cksum_add(udp_sum,
+			    cksum_add(~oport, nport));
+
 		group = g->dst_ip.ipv6.egroup;
 		naddr = oaddr = ntohs(ip6.ip6_dst.s6_addr16[group]);
 		nport = oport = ntohs(udp.uh_dport);
