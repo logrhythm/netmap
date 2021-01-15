@@ -4,6 +4,7 @@ Release:       %{buildnumber}%{?dist}
 Summary:       netmap for Network Monitor
 Group:         Development/Tools
 License:       Dual BSD/GPL
+
 BuildRequires: kernel-devel = 4.18.0-193.19.1.el8_2, kernel = @KERNEL_VERSION@
 Requires:      kernel = @KERNEL_VERSION@
 ExclusiveArch: x86_64
