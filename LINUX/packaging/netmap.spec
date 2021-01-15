@@ -4,7 +4,8 @@ Release:       %{buildnumber}%{?dist}
 Summary:       netmap for Network Monitor
 Group:         Development/Tools
 License:       Dual BSD/GPL
-BuildRequires: kernel-devel = @KERNEL_VERSION@, kernel = @KERNEL_VERSION@
+
+BuildRequires: kernel-devel = 4.18.0-193.19.1.el8_2, kernel = @KERNEL_VERSION@
 Requires:      kernel = @KERNEL_VERSION@
 ExclusiveArch: x86_64
 
@@ -21,7 +22,7 @@ fi
 
 %build
 cd %{name}/LINUX/
-./configure --no-drivers --cc=/usr/local/gcc/bin/gcc
+./configure --no-drivers --kernel-dir=/usr/src/kernels/4.18.0-193.19.1.el8_2.x86_64/
 make CONFIG_MODULE_SIG=n
 
 %install
