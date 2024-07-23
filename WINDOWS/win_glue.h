@@ -67,13 +67,13 @@
 
 #include <ndis.h>
 #include <string.h>
-#include <WinDef.h>
+//#include <WinDef.h>
 //#include <Iptypes.h>		// definition of IP_ADAPTER_INFO
-#include <netioapi.h>		// definition of IF_NAMESIZE
-#include <ntddk.h>		// various NT definitions
-#include <errno.h>
-#include <intrin.h>		//machine specific code (for example le64toh)
-#include <Ntstrsafe.h>
+//#include <netioapi.h>		// definition of IF_NAMESIZE
+//#include <ntddk.h>		// various NT definitions
+//#include <errno.h>
+//#include <intrin.h>		//machine specific code (for example le64toh)
+//#include <Ntstrsafe.h>
 
 
 #define	M_DEVBUF		'nmDb'	/* netmap pool for memory allocation */

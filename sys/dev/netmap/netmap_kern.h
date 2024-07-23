@@ -31,7 +31,8 @@
  * The header contains the definitions of constants and function
  * prototypes used only in kernelspace.
  */
-
+#include "/usr/src/kernels/5.14.0-427.22.1.el9_4.x86_64/include/linux/ethtool.h"
+#include "/home/raj/netmon/repo/netmap/WINDOWS/win_glue.h"
 #ifndef _NET_NETMAP_KERN_H_
 #define _NET_NETMAP_KERN_H_
 
