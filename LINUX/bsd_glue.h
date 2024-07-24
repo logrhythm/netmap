@@ -54,10 +54,12 @@
 #include <linux/delay.h>	// msleep
 #include <linux/skbuff.h>		// skb_copy_to_linear_data_offset
 #include <linux/vmalloc.h>
+#include <linux/ethtool.h>
 
 #include <linux/io.h>	// virt_to_phys
 #include <linux/hrtimer.h>
 #include <linux/highmem.h> // kmap
+#include <linux/if_vlan.h> // tags
 
 #define KASSERT(a, b)		BUG_ON(!(a))
 
@@ -147,6 +149,9 @@ struct net_device_ops {
 			NM_SET_PAGE_COUNT(&(page)[i_], 1);\
 	} while (0)
 #endif /* HAVE_SPLIT_PAGE */
+#ifndef NETMAP_LINUX_HAVE_FOLL_SPLIT
+#define FOLL_SPLIT	FOLL_SPLIT_PMD
+#endif
 
 #if !defined(NETMAP_LINUX_HAVE_NNITD) && !defined(netdev_notifier_info_to_dev)
 #define netdev_notifier_info_to_dev(ptr)	(ptr)
@@ -294,19 +299,31 @@ struct thread;
  * in linux we have no spares so we overload ax25_ptr, and the detection
  * for netmap-capable is some magic in the area pointed by that.
  */
-#define WNA(_ifp)		(_ifp)->ax25_ptr
+#define if_setnetmapadapter(_ifp, _na)	do { 				\
+	(_ifp)->ax25_ptr = _na;						\
+} while (0)
+#define if_getnetmapadapter(_ifp)	((struct netmap_adapter *)(_ifp)->ax25_ptr)
+
 /* use the default NM_ATTACH_NA/NM_DETACH_NA defined in netmap_kernel.h */
 #else /* !NETMAP_LINUX_HAVE_AX25PTR */
 /*
  * We hide behind the ethtool_ops
  */
-int linux_netmap_set_ringparam(struct net_device *, struct ethtool_ringparam *);
+int linux_netmap_set_ringparam(struct net_device *, struct ethtool_ringparam *
+#ifdef NETMAP_LINUX_HAVE_SETRNGPRM_4ARGS
+		, struct kernel_ethtool_ringparam *
+		, struct netlink_ext_ack *
+#endif /* NETMAP_LINUX_HAVE_SETRNGPRM_4ARGS */
+		);
 struct netmap_linux_magic {
 	struct ethtool_ops eto;
 	const struct ethtool_ops *save_eto;
 };
 #define NM_OS_MAGIC	struct netmap_linux_magic
-#define WNA(ifp)	(ifp->ethtool_ops)
+#define if_setnetmapadapter(_ifp, _na) do {				\
+	(_ifp)->ethtool_ops = _na;					\
+} while (0)
+#define if_getnetmapadapter(_ifp)	((struct netmap_adapter *)(_ifp)->ethtool_ops)
 #define NM_DETACH_NA(ifp)  do {						\
 	(ifp)->ethtool_ops = NA(ifp)->magic.save_eto;			\
 } while (0)
@@ -334,7 +351,10 @@ struct netmap_linux_magic {
 #endif /* NETAP_LINUX_HAVE_AX25PTR */
 
 #define ifnet           	net_device      /* remap */
-#define	if_xname		name		/* field ifnet-> net_device */
+typedef struct net_device* 	if_t;	/* remap */
+#define if_name(ifp)		ifp->name
+
+#define	if_inc_counter(ifp, flags, cnt) 	do {} while (0)
 
 /* some other FreeBSD APIs */
 struct net_device* ifunit_ref(const char *name);
@@ -348,7 +368,6 @@ netdev_tx_t linux_netmap_start_xmit(struct sk_buff *, struct net_device *);
 int linux_netmap_change_mtu(struct net_device *dev, int new_mtu);
 
 /* prevent ring params change while in netmap mode */
-int linux_netmap_set_ringparam(struct net_device *, struct ethtool_ringparam *);
 #ifdef NETMAP_LINUX_HAVE_SET_CHANNELS
 int linux_netmap_set_channels(struct net_device *, struct ethtool_channels *);
 #endif
@@ -378,7 +397,7 @@ static inline void mtx_unlock(safe_spinlock_t *m)
 }
 
 #define mtx_init(a, b, c, d)	spin_lock_init(&((a)->sl))
-#define mtx_destroy(a)
+#define mtx_destroy(a)		do {} while(0)
 
 #define mtx_lock_spin(a)	mtx_lock(a)
 #define mtx_unlock_spin(a)	mtx_unlock(a)
@@ -416,7 +435,7 @@ static inline int ilog2(uint64_t n)
 #define contigmalloc(sz, ty, flags, a, b, pgsz, c) ({		\
 	unsigned int order_ =					\
 		ilog2(roundup_pow_of_two(sz)/PAGE_SIZE);	\
-	struct page *p_ = alloc_pages(GFP_ATOMIC | __GFP_ZERO,  \
+	struct page *p_ = alloc_pages(GFP_USER | __GFP_ZERO,  \
 		order_);					\
 	if (p_ != NULL) 					\
 		split_page(p_, order_);				\
@@ -440,8 +459,24 @@ struct nm_linux_selrecord_t;
 
 #define	tsleep(a, b, c, t)	msleep(10)
 
-#define microtime		do_gettimeofday		/* debugging */
+#ifndef NETMAP_LINUX_HAVE_STRUCT_TIMEVAL
+struct timeval {
+	long	tv_sec;		/* seconds */
+	long	tv_usec;	/* microseconds */
+};
+#endif /* !NETMAP_LINUX_HAVE_STRUCT_TIMEVAL */
 
+#define microtime		do_gettimeofday		/* debugging */
+#ifndef NETMAP_LINUX_HAVE_DO_GETTIMEOFDAY
+#define do_gettimeofday(tv_)					\
+	do {							\
+		struct timespec64 now_;				\
+								\
+		ktime_get_real_ts64(&now_);			\
+		(tv_)->tv_sec = now_.tv_sec;			\
+		(tv_)->tv_usec = now_.tv_nsec/1000;		\
+	} while (0)
+#endif /* !NETMAP_LINUX_HAVE_DO_GETTIMEOFDAY */
 
 /*
  * The following trick is to map a struct cdev into a struct miscdevice
@@ -459,7 +494,7 @@ struct nm_linux_selrecord_t;
  */
 #define make_dev_credf(_flags, _cdev, _zero, _cred, _uid, _gid, _perm, _name)	\
 	({error = misc_register(_cdev);				\
-	D("run mknod /dev/%s c %d %d # returned %d",		\
+	nm_prinf("run mknod /dev/%s c %d %d # returned %d",	\
 	    (_cdev)->name, MISC_MAJOR, (_cdev)->minor, error);	\
 	 _cdev; } )
 #define destroy_dev(_cdev)	misc_deregister(_cdev)
@@ -470,6 +505,7 @@ struct nm_linux_selrecord_t;
  * windows: they are emulated via get/setsockopt
  */
 #define CTLFLAG_RD              1
+#define CTLFLAG_RDTUN           CTLFLAG_RD
 #define CTLFLAG_RW              2
 
 struct sysctl_oid;
@@ -537,5 +573,32 @@ void netmap_bns_unregister(void);
 #ifndef BIT_ULL
 #define BIT_ULL(nr)	(1ULL << (nr))
 #endif /* !BIT_ULL */
+
+#ifndef NETMAP_LINUX_HAVE_ONLINE_CPUS
+#define get_online_cpus()	cpus_read_lock()
+#define put_online_cpus()	cpus_read_unlock()
+#endif /* NETMAP_LINUX_HAVE_ONLINE_CPUS */
+
+#ifdef NETMAP_LINUX_HAVE_NAPI_POLL_WEIGHT
+#define NM_NETIF_NAPI_ADD	netif_napi_add_weight
+#else
+#define NM_NETIF_NAPI_ADD	netif_napi_add
+#endif /* NETMAP_LINUX_HAVE_NAPI_POLL_WEIGHT */
+
+#ifdef NETMAP_LINUX_HAVE_DEV_ADDR_SET
+#define NM_DEV_ADDR_SET(a_, m_)	dev_addr_set(a_, m_)
+#else
+#define NM_DEV_ADDR_SET(a_, m_)	memcpy((a_)->dev_addr, m_, (a_)->addr_len)
+#endif	/* NETMAP_LINUX_HAVE_DEV_ADDR_SET */
+
+#ifdef NETMAP_LINUX_HAVE_STRSCPY
+#define strlcpy	strscpy
+#endif /* NETMAP_LINUX_HAVE_STRSCPY */
+
+#ifdef NETMAP_LINUX_HAVE_EVENTFD_SIG_2ARGS
+#define NM_EVENTFD_SIGNAL(c_)	eventfd_signal(c_, 1)
+#else
+#define NM_EVENTFD_SIGNAL	eventfd_signal
+#endif /* NETMAP_LINUX_HAVE_EVENTFD_SIG_2ARGS */
 
 #endif /* NETMAP_BSD_GLUE_H */

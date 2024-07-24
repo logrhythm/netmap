@@ -107,7 +107,7 @@ ixgbe_netmap_intr(struct netmap_adapter *na, int onoff)
 static void
 ixgbe_netmap_intr(struct netmap_adapter *na, int onoff)
 {
-	RD(5, "per-queue irq disable not supported");
+	nm_prlim(1, "per-queue irq disable not supported");
 }
 #endif /* NETMAP_LINUX_IXGBE_HAVE_DISABLE */
 
@@ -122,12 +122,13 @@ ixgbe_netmap_configure_srrctl(struct NM_IXGBE_ADAPTER *adapter, struct NM_IXGBE_
 	struct ixgbe_hw *hw = &adapter->hw;
 	u32 srrctl;
 	u8 reg_idx = rx_ring->reg_idx;
+	struct netmap_kring *kring = na->rx_rings[reg_idx];
 
 	if (hw->mac.type == ixgbe_mac_82598EB) {
 		u16 mask = adapter->ring_feature[RING_F_RSS].mask;
 		reg_idx &= mask;
 	}
-	srrctl = ((NETMAP_BUF_SIZE(na) + 1023) >> IXGBE_SRRCTL_BSIZEPKT_SHIFT);
+	srrctl =  kring->hwbuf_len >> IXGBE_SRRCTL_BSIZEPKT_SHIFT;
 	/*
 	 * XXX
 	 * With Advanced RX descriptor, the address needs to be rewritten,
@@ -136,7 +137,7 @@ ixgbe_netmap_configure_srrctl(struct NM_IXGBE_ADAPTER *adapter, struct NM_IXGBE_
 	 * (ixgbe datasheet - Section 7.1.9)
 	 */
 	srrctl |= IXGBE_SRRCTL_DESCTYPE_ADV_ONEBUF;
-	ND("bufsz: %d srrctl: %x", NETMAP_BUF_SIZE(na), srrctl);
+	nm_prdis("bufsz: %d srrctl: %x", kring->hwbuf_len, srrctl);
 	IXGBE_WRITE_REG(hw, IXGBE_SRRCTL(reg_idx), srrctl);
 }
 
@@ -181,14 +182,14 @@ static void
 ixgbe_netmap_intr(struct netmap_adapter *na, int onoff)
 {
 	// TODO
-	RD(5, "per-queue irq disable not supported");
+	nm_prlim(5, "per-queue irq disable not supported");
 }
 
 static void
 ixgbe_netmap_configure_srrctl(struct NM_IXGBE_ADAPTER *adapter, struct NM_IXGBE_RING *rx_ring)
 {
 	// TODO
-	D("not supported");
+	nm_prerr("not supported");
 }
 
 #ifdef NETMAP_LINUX_IXGBEVF_HAVE_NTA
@@ -238,7 +239,7 @@ ixgbe_netmap_reg(struct netmap_adapter *na, int onoff)
 	} else {
 		nm_clear_native_flags(na);
 	}
-	/* XXX SRIOV migth need another 2sec wait */
+	/* XXX SRIOV might need another 2sec wait */
 	if (netif_running(adapter->netdev))
 		NM_IXGBE_UP(adapter);	/* also enables intr */
 	clear_bit(NM_IXGBE_RESETTING, &adapter->state);
@@ -329,7 +330,7 @@ ixgbe_netmap_txsync(struct netmap_kring *kring, int flags)
 			struct netmap_slot *slot = &ring->slot[nm_i];
 			u_int len = slot->len;
 			uint64_t paddr;
-			void *addr = PNMB(na, slot, &paddr);
+			uint64_t offset = nm_get_offset(kring, slot);
 
 			/* device-specific */
 			union ixgbe_adv_tx_desc *curr = NM_IXGBE_TX_DESC(txr, nic_i);
@@ -337,7 +338,8 @@ ixgbe_netmap_txsync(struct netmap_kring *kring, int flags)
 				IXGBE_ADVTXD_DCMD_IFCS;
 			u_int totlen = len;
 
-			NM_CHECK_ADDR_LEN(na, addr, len);
+			PNMB(na, slot, &paddr);
+			NM_CHECK_ADDR_LEN_OFF(na, len, offset);
 
 			report = slot->flags & NS_REPORT ||
 				nic_i == 0 ||
@@ -350,7 +352,7 @@ ixgbe_netmap_txsync(struct netmap_kring *kring, int flags)
 				 */
 				union ixgbe_adv_tx_desc *first = curr;
 
-				first->read.buffer_addr = htole64(paddr);
+				first->read.buffer_addr = htole64(paddr + offset);
 				first->read.cmd_type_len = htole32(len | hw_flags);
 				netmap_sync_map_dev(na, (bus_dma_tag_t) na->pdev,
 						&paddr, len, NR_TX);
@@ -373,13 +375,14 @@ ixgbe_netmap_txsync(struct netmap_kring *kring, int flags)
 					}
 					slot = &ring->slot[nm_i];
 					len = slot->len;
-					addr = PNMB(na, slot, &paddr);
-					NM_CHECK_ADDR_LEN(na, addr, len);
+					PNMB(na, slot, &paddr);
+					offset = nm_get_offset(kring, slot);
+					NM_CHECK_ADDR_LEN_OFF(na, len, offset);
 					curr = NM_IXGBE_TX_DESC(txr, nic_i);
 					totlen += len;
 					if (!(slot->flags & NS_MOREFRAG))
 						break;
-					curr->read.buffer_addr = htole64(paddr);
+					curr->read.buffer_addr = htole64(paddr + offset);
 					curr->read.olinfo_status = 0;
 					curr->read.cmd_type_len = htole32(len | hw_flags);
 
@@ -400,7 +403,7 @@ ixgbe_netmap_txsync(struct netmap_kring *kring, int flags)
 			slot->flags &= ~(NS_REPORT | NS_BUF_CHANGED | NS_MOREFRAG);
 
 			/* Fill the slot in the NIC ring. */
-			curr->read.buffer_addr = htole64(paddr);
+			curr->read.buffer_addr = htole64(paddr + offset);
 			curr->read.olinfo_status = htole32(totlen << IXGBE_ADVTXD_PAYLEN_SHIFT);
 			curr->read.cmd_type_len = htole32(len | hw_flags);
 			netmap_sync_map_dev(na, (bus_dma_tag_t) na->pdev, &paddr, len, NR_TX);
@@ -423,7 +426,7 @@ ixgbe_netmap_txsync(struct netmap_kring *kring, int flags)
 	if ((flags & NAF_FORCE_RECLAIM) || nm_kr_txempty(kring)) {
 		nic_i = NM_ACCESS_ONCE(*ina->heads[ring_nr].phead);
 		nm_i = netmap_idx_n2k(kring, nic_i);
-		ND(5, "%s: h %d", kring->name, h);
+		nm_prdis(5, "%s: h %d", kring->name, h);
 		kring->nr_hwtail = nm_prev(nm_i, lim);
 	}
 #else /* NM_IXGBE_USE_TDH */
@@ -453,7 +456,7 @@ ixgbe_netmap_txsync(struct netmap_kring *kring, int flags)
 		nic_i = (nic_i < kring->nkr_num_slots / 4 ||
 			 nic_i >= kring->nkr_num_slots*3/4) ?
 			0 : report_frequency;
-		reclaim_tx = txd[nic_i].wb.status & IXGBE_TXD_STAT_DD;	// XXX cpu_to_le32 ?
+		reclaim_tx = le32toh(txd[nic_i].wb.status) & IXGBE_TXD_STAT_DD;
 	}
 	if (reclaim_tx) {
 		/*
@@ -467,8 +470,8 @@ ixgbe_netmap_txsync(struct netmap_kring *kring, int flags)
 		 * good way.
 		 */
 		nic_i = IXGBE_READ_REG(&adapter->hw, NM_IXGBE_TDH(ring_nr));
-		if (nic_i >= kring->nkr_num_slots) { /* XXX can it happen ? */
-			D("TDH wrap %d", nic_i);
+		if (unlikely(nic_i >= kring->nkr_num_slots)) {
+			nm_prerr("%s: TDH overflow (%d)", kring->name, nic_i);
 			nic_i -= kring->nkr_num_slots;
 		}
 		nm_i = netmap_idx_n2k(kring, nic_i);
@@ -482,7 +485,7 @@ ixgbe_netmap_txsync(struct netmap_kring *kring, int flags)
 	for ( ; tosync != nm_i; tosync = nm_next(tosync, lim)) {
 		struct netmap_slot *slot = &ring->slot[tosync];
 		uint64_t paddr;
-		(void)PNMB(na, slot, &paddr);
+		(void)PNMB_O(kring, slot, &paddr);
 
 		netmap_sync_map_cpu(na, (bus_dma_tag_t) na->pdev,
 				&paddr, slot->len, NR_TX);
@@ -547,6 +550,8 @@ ixgbe_netmap_rxsync(struct netmap_kring *kring, int flags)
 	 * rxr->next_to_clean is set to 0 on a ring reinit
 	 */
 	if (netmap_no_pendintr || force_update) {
+		u_int new_hwtail = (u_int)-1;
+
 		nic_i = rxr->next_to_clean;
 		nm_i = netmap_idx_n2k(kring, nic_i);
 
@@ -556,6 +561,7 @@ ixgbe_netmap_rxsync(struct netmap_kring *kring, int flags)
 			u_int size = le16toh(curr->wb.upper.length);
 			uint64_t paddr;
 			struct netmap_slot *slot = &ring->slot[nm_i];
+			int complete;
 
 			if (!size)
 				break;
@@ -565,13 +571,17 @@ ixgbe_netmap_rxsync(struct netmap_kring *kring, int flags)
 			staterr = le32toh(curr->wb.upper.status_error);
 
 			slot->len = size;
-			slot->flags = (!(staterr & IXGBE_RXD_STAT_EOP) ? NS_MOREFRAG : 0);
-			PNMB(na, slot, &paddr);
+			complete = staterr & IXGBE_RXD_STAT_EOP;
+			slot->flags = complete ? 0 : NS_MOREFRAG;
+			PNMB_O(kring, slot, &paddr);
 			netmap_sync_map_cpu(na, (bus_dma_tag_t) na->pdev,
 					&paddr, size, NR_RX);
 
 			nm_i = nm_next(nm_i, lim);
 			nic_i = nm_next(nic_i, lim);
+
+			if (complete)
+				new_hwtail = nm_i;
 		}
 		if (n) { /* update the state variables */
 			rxr->next_to_clean = nic_i;
@@ -579,7 +589,11 @@ ixgbe_netmap_rxsync(struct netmap_kring *kring, int flags)
 #ifdef NETMAP_LINUX_HAVE_NTA
 			rxr->next_to_alloc = rxr->next_to_clean;
 #endif /* NETMAP_LINUX_HAVE_NTA */
-			kring->nr_hwtail = nm_i;
+			if (new_hwtail != (u_int)-1) {
+				/* Update nr_hwtail only if we saw a complete
+				 * packet in the previous loop. */
+				kring->nr_hwtail = new_hwtail;
+			}
 		}
 		kring->nr_kflags &= ~NKR_PENDINTR;
 	}
@@ -599,6 +613,7 @@ ixgbe_netmap_rxsync(struct netmap_kring *kring, int flags)
 			struct netmap_slot *slot = &ring->slot[nm_i];
 			uint64_t paddr;
 			void *addr = PNMB(na, slot, &paddr);
+			uint64_t offset = nm_get_offset(kring, slot);
 
 			union ixgbe_adv_rx_desc *curr = NM_IXGBE_RX_DESC(rxr, nic_i);
 			if (addr == NETMAP_BUF_BASE(na)) /* bad buf */
@@ -611,7 +626,7 @@ ixgbe_netmap_rxsync(struct netmap_kring *kring, int flags)
 					&paddr, NETMAP_BUF_SIZE(na), NR_RX);
 			curr->wb.upper.length = 0;
 			curr->wb.upper.status_error = 0;
-			curr->read.pkt_addr = htole64(paddr);
+			curr->read.pkt_addr = htole64(paddr + offset);
 			nm_i = nm_next(nm_i, lim);
 			nic_i = nm_next(nic_i, lim);
 		}
@@ -646,6 +661,7 @@ ixgbe_netmap_configure_tx_ring(struct NM_IXGBE_ADAPTER *adapter, int ring_nr, u3
 	struct ixgbe_hw *hw = &adapter->hw;
 	struct netmap_ixgbe_adapter *ina = (struct netmap_ixgbe_adapter *)na;
 	u64 wba;
+	struct netmap_ixgbe_head *h;
 #endif /* !NM_IXGBE_USE_TDH */
 
 	slot = netmap_reset(na, NR_TX, ring_nr, 0);
@@ -660,6 +676,9 @@ ixgbe_netmap_configure_tx_ring(struct NM_IXGBE_ADAPTER *adapter, int ring_nr, u3
 	IXGBE_WRITE_REG(hw, NM_IXGBE_TDWBAL(ring_nr),
 		(wba & DMA_BIT_MASK(32)) | IXGBE_TDWBAL_HEAD_WB_ENABLE);
 	IXGBE_WRITE_REG(hw, NM_IXGBE_TDWBAH(ring_nr), wba >> 32);
+	/* reset all heads */
+	h = &ina->heads[ring_nr];
+	*h->phead = 0;
 #endif /* !NM_IXGBE_USE_TDH */
 
 #if 0
@@ -703,26 +722,29 @@ ixgbe_netmap_configure_rx_ring(struct NM_IXGBE_ADAPTER *adapter, int ring_nr)
 	struct netmap_slot *slot;
 	int lim, i;
 	struct NM_IXGBE_RING *ring = NM_IXGBE_RX_RING(adapter, ring_nr);
+	struct netmap_kring *kring;
 
 	slot = netmap_reset(na, NR_RX, ring_nr, 0);
 	/* same as in ixgbe_setup_transmit_ring() */
 	if (!slot)
 		return 0;	// not in native netmap mode
-	// XXX can we move it later ?
+
+	kring = na->rx_rings[ring_nr];
+
 	ixgbe_netmap_configure_srrctl(adapter, ring);
 
 	lim = na->num_rx_desc - 1 - nm_kr_rxspace(na->rx_rings[ring_nr]);
 
-	for (i = 0; i < na->num_rx_desc; i++) {
+	for (i = 0; i <= lim; i++) {
 		/*
 		 * Fill the map and set the buffer address in the NIC ring,
 		 * considering the offset between the netmap and NIC rings
 		 * (see comment in ixgbe_setup_transmit_ring() ).
 		 */
-		int si = netmap_idx_n2k(na->rx_rings[ring_nr], i);
+		int si = netmap_idx_n2k(kring, i);
 		union ixgbe_adv_rx_desc *curr = NM_IXGBE_RX_DESC(ring, i);
 		uint64_t paddr;
-		PNMB(na, slot + si, &paddr);
+		PNMB_O(kring, slot + si, &paddr);
 		/* Update descriptor */
 		curr->read.pkt_addr = htole64(paddr);
 		curr->wb.upper.length = 0;
@@ -764,7 +786,7 @@ ixgbe_netmap_create_heads(struct netmap_adapter *na)
 			goto err;
 		}
 		*h->phead = 0;
-		ND("%s: phead %p *phead %x", na->tx_rings[i].name, h->phead, *h->phead);
+		nm_prdis("%s: phead %p *phead %x", na->tx_rings[i].name, h->phead, *h->phead);
 	}
 	return 0;
 
@@ -840,6 +862,25 @@ ixgbe_netmap_config(struct netmap_adapter *na, struct nm_config_info *info)
 	return 0;
 }
 
+static int
+ixgbe_netmap_bufcfg(struct netmap_kring *kring, uint64_t target)
+{
+	kring->buf_align = 0;
+
+	if (kring->tx == NR_TX) {
+		kring->hwbuf_len = target;
+		return 0;
+	}
+
+	target >>= 10;
+	if (target < 1 || target > 16)
+		return EINVAL;
+
+	kring->hwbuf_len = target << 10;
+
+	return 0;
+}
+
 
 static void ixgbe_netmap_detach(struct NM_IXGBE_ADAPTER *adapter);
 /*
@@ -858,7 +899,7 @@ ixgbe_netmap_attach(struct NM_IXGBE_ADAPTER *adapter)
 
 	na.ifp = adapter->netdev;
 	na.pdev = &adapter->pdev->dev;
-	na.na_flags = NAF_MOREFRAG;
+	na.na_flags = NAF_MOREFRAG | NAF_OFFSETS;
 	na.num_tx_desc = NM_IXGBE_TX_RING(adapter, 0)->count;
 	na.num_rx_desc = NM_IXGBE_RX_RING(adapter, 0)->count;
 	na.num_tx_rings = adapter->num_tx_queues;
@@ -871,6 +912,7 @@ ixgbe_netmap_attach(struct NM_IXGBE_ADAPTER *adapter)
 	na.nm_krings_delete = ixgbe_netmap_krings_delete;
 	na.nm_intr = ixgbe_netmap_intr;
 	na.nm_config = ixgbe_netmap_config;
+	na.nm_bufcfg = ixgbe_netmap_bufcfg;
 
 	if (netmap_attach_ext(&na, sizeof(struct netmap_ixgbe_adapter), 1)) {
 		pr_err("netmap: failed to attach netmap adapter");

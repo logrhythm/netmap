@@ -35,11 +35,10 @@
 #include <stdarg.h>
 #include <strings.h>
 #include <unistd.h>
-#define NETMAP_WITH_LIBS
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
-#include <net/netmap_user.h>
+#include <libnetmap.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/ip6.h>
@@ -51,6 +50,7 @@
 #include <sys/uio.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <sys/ioctl.h>
 
 #include "fd_server.h"
 
@@ -76,10 +76,8 @@ struct extra_buffer {
 	TAILQ_ENTRY(extra_buffer) list_entry;
 };
 
-;
-
 struct Global {
-	struct nm_desc *nmd;
+	struct nmport_d *nmd;
 	const char *ifname;
 	unsigned wait_link_secs;    /* wait for link */
 	unsigned timeout_secs;      /* transmit/receive timeout */
@@ -125,7 +123,7 @@ void release_if_fd(struct Global *, const char *);
 void release_extra_buffers(struct Global *);
 
 void
-verbose_print(int current_verbosity, int required_verbosity, char *format, ...)
+verbose_print(int current_verbosity, int required_verbosity, const char *format, ...)
 {
 	va_list args;
 
@@ -138,7 +136,7 @@ verbose_print(int current_verbosity, int required_verbosity, char *format, ...)
 }
 
 void
-verbose_perror(int current_verbosity, int required_verbosity, char *str)
+verbose_perror(int current_verbosity, int required_verbosity, const char *str)
 {
 	if (current_verbosity >= required_verbosity) {
 		perror(str);
@@ -155,7 +153,7 @@ cleanup(struct Global *g)
 	if (g->request_from_fd_server) {
 		release_if_fd(g, g->ifname);
 	} else {
-		nm_close(g->nmd);
+		nmport_close(g->nmd);
 	}
 }
 
@@ -328,22 +326,10 @@ build_packet(struct Global *g)
 	                                                           udpofs))))));
 }
 
-// static unsigned
-// tx_bytes_avail(struct netmap_ring *ring, unsigned max_frag_size)
-// {
-// 	unsigned avail_per_slot = ring->nr_buf_size;
-
-// 	if (max_frag_size < avail_per_slot) {
-// 		avail_per_slot = max_frag_size;
-// 	}
-
-// 	return nm_ring_space(ring) * avail_per_slot;
-// }
-
 static int
 tx_flush(struct Global *g)
 {
-	struct nm_desc *nmd = g->nmd;
+	struct nmport_d *nmd = g->nmd;
 	unsigned elapsed_ms = 0;
 	unsigned wait_ms    = 100;
 	int i;
@@ -383,7 +369,7 @@ ring_avail_packets(struct netmap_ring *ring, unsigned pkt_len)
 }
 
 uint64_t
-adapter_avail_sends(struct nm_desc *nmd, unsigned pkt_len)
+adapter_avail_sends(struct nmport_d *nmd, unsigned pkt_len)
 {
 	uint64_t sends_available = 0;
 	unsigned int i;
@@ -451,7 +437,7 @@ next_fill(char cur_fill)
 static int
 tx(struct Global *g, unsigned packets_num)
 {
-	struct nm_desc *nmd = g->nmd;
+	struct nmport_d *nmd = g->nmd;
 	unsigned elapsed_ms = 0;
 	unsigned wait_ms    = 100;
 	unsigned int i;
@@ -522,7 +508,7 @@ ignore_received_frame(struct Global *g)
 }
 
 uint64_t
-adapter_avail_receives(struct nm_desc *nmd, unsigned pkt_len)
+adapter_avail_receives(struct nmport_d *nmd, unsigned pkt_len)
 {
 	uint64_t receives_available = 0;
 	unsigned int i;
@@ -614,7 +600,7 @@ read_one_packet(struct Global *g, struct netmap_ring *ring)
 static int
 rx(struct Global *g, unsigned packets_num)
 {
-	struct nm_desc *nmd = g->nmd;
+	struct nmport_d *nmd = g->nmd;
 	unsigned elapsed_ms = 0;
 	unsigned wait_ms    = 100;
 	unsigned int i;
@@ -673,7 +659,7 @@ rx(struct Global *g, unsigned packets_num)
 				goto again;
 			}
 
-			/* As soon as we find a packet wich doesn't match our
+			/* As soon as we find a packet which doesn't match our
 			 * packet model we exit with status EXIT_FAILURE.
 			 */
 			if (rx_check(g)) {
@@ -806,7 +792,7 @@ usage(FILE *stream)
 	        "    [-F MAX_FRAGMENT_SIZE (=inf)]\n"
 	        "    [-T TIMEOUT_SECS (=1)]\n"
 	        "    [-w WAIT_FOR_LINK_SECS (=0)]\n"
-	        "    [-t LEN[:FILLCHAR[:NUM]] (trasmit NUM packets with size "
+	        "    [-t LEN[:FILLCHAR[:NUM]] (transmit NUM packets with size "
 	        "LEN bytes)]\n"
 	        "    [-r LEN[:FILLCHAR[:NUM]] (expect to receive NUM packets "
 	        "with size LEN bytes)]\n"
@@ -823,43 +809,6 @@ usage(FILE *stream)
 	        "\nExample:\n"
 	        "    $ ./functional -i netmap:lo -t 100 -r 100 -t 40:b:2 -r "
 	        "40:b:2\n");
-}
-
-/* TODO: Move functions to communicate to the fd_server to another file */
-/* Copied from nm_open() */
-void
-fill_nm_desc(struct nm_desc *des, struct nmreq *req, int fd)
-{
-	uint32_t nr_reg;
-
-	memset(des, 0, sizeof(*des));
-	des->self = des;
-	des->fd   = fd;
-	memcpy(&des->req, req, sizeof(des->req));
-	nr_reg = req->nr_flags & NR_REG_MASK;
-
-	if (nr_reg == NR_REG_SW) { /* host stack */
-		des->first_tx_ring = des->last_tx_ring = des->req.nr_tx_rings;
-		des->first_rx_ring = des->last_rx_ring = des->req.nr_rx_rings;
-	} else if (nr_reg == NR_REG_ALL_NIC) { /* only nic */
-		des->first_tx_ring = 0;
-		des->first_rx_ring = 0;
-		des->last_tx_ring  = des->req.nr_tx_rings - 1;
-		des->last_rx_ring  = des->req.nr_rx_rings - 1;
-	} else if (nr_reg == NR_REG_NIC_SW) {
-		des->first_tx_ring = 0;
-		des->first_rx_ring = 0;
-		des->last_tx_ring  = des->req.nr_tx_rings;
-		des->last_rx_ring  = des->req.nr_rx_rings;
-	} else if (nr_reg == NR_REG_ONE_NIC) {
-		/* XXX check validity */
-		des->first_tx_ring = des->last_tx_ring = des->first_rx_ring =
-		        des->last_rx_ring =
-		                des->req.nr_ringid & NETMAP_RING_MASK;
-	} else { /* pipes */
-		des->first_tx_ring = des->last_tx_ring = 0;
-		des->first_rx_ring = des->last_rx_ring = 0;
-	}
 }
 
 int
@@ -911,7 +860,7 @@ start_fd_server(struct Global *g)
 		return;
 	}
 
-	if (execl("fd_server", "fd_server", (char *)NULL)) {
+	if (execlp("fd_server", "fd_server", (char *)NULL)) {
 		verbose_perror(g->verbosity_level, LV_ERROR_MSG, "exec()");
 		exit(EXIT_FAILURE);
 	}
@@ -953,6 +902,7 @@ recv_fd(int socket, int *fd, void *buf, size_t buf_size)
 	cmsg->cmsg_len     = CMSG_LEN(sizeof(int));
 	amount             = recvmsg(socket, &msg, 0);
 	if (amount == -1) {
+		printf("recv_fd(): recvmsg failed\n");
 		return -1;
 	}
 
@@ -971,12 +921,12 @@ recv_fd(int socket, int *fd, void *buf, size_t buf_size)
 	return amount;
 }
 
-struct nm_desc *
+struct nmport_d *
 get_if_fd(struct Global *g, const char *if_name)
 {
 	struct fd_response res;
 	struct fd_request req;
-	struct nm_desc *nmd;
+	struct nmport_d *nmd;
 	int socket_fd;
 	int new_fd;
 	int ret;
@@ -988,7 +938,7 @@ get_if_fd(struct Global *g, const char *if_name)
 
 	memset(&req, 0, sizeof(req));
 	req.action = FD_GET;
-	strncpy(req.if_name, if_name, sizeof(req.if_name));
+	strncpy(req.if_name, if_name, sizeof(req.if_name)-1);
 	ret = send(socket_fd, &req, sizeof(req), 0);
 	if (ret < 0) {
 		verbose_perror(g->verbosity_level, LV_ERROR_MSG, "send()");
@@ -1003,14 +953,20 @@ get_if_fd(struct Global *g, const char *if_name)
 	}
 	close(socket_fd);
 
-	nmd = malloc(sizeof(*nmd));
+	nmd = nmport_new();
 	if (nmd == NULL) {
 		verbose_perror(g->verbosity_level, LV_ERROR_MSG, "malloc()");
 		return NULL;
 	}
 
-	fill_nm_desc(nmd, &res.req, new_fd);
-	if (nm_mmap(nmd, NULL) != 0) {
+	// unmarshal the response
+	nmd->hdr = res.hdr;
+	nmd->reg = res.reg;
+	nmd->hdr.nr_body = (uintptr_t)&nmd->reg;
+	nmd->fd = new_fd;
+	nmd->register_done = 1;
+
+	if (nmport_mmap(nmd) != 0) {
 		verbose_perror(g->verbosity_level, LV_ERROR_MSG, "nm_mmap()");
 		return NULL;
 	}
@@ -1032,7 +988,7 @@ release_if_fd(struct Global *g, const char *if_name)
 
 	memset(&req, 0, sizeof(req));
 	req.action = FD_RELEASE;
-	strncpy(req.if_name, if_name, sizeof(req.if_name));
+	strncpy(req.if_name, if_name, sizeof(req.if_name)-1);
 
 	ret = send(socket_fd, &req, sizeof(req), 0);
 	if (ret <= 0) {
@@ -1052,7 +1008,7 @@ stop_fd_server(struct Global *g)
 	socket_fd = connect_to_fd_server(g);
 	if (socket_fd == -1) {
 		verbose_print(g->verbosity_level, LV_DEBUG_SEND_RECV,
-		              "fd_server alredy down\n");
+		              "fd_server already down\n");
 		return;
 	}
 	verbose_print(g->verbosity_level, LV_DEBUG_SEND_RECV,
@@ -1067,7 +1023,7 @@ stop_fd_server(struct Global *g)
 	/* By calling recv() we synchronize with the fd_server closing the
 	 * socket.
 	 * This way we're sure that during the next call to ./functional
-	 * the fd_server has alredy closed its end and we avoid a possible race
+	 * the fd_server has already closed its end and we avoid a possible race
 	 * condition. Otherwise the call to functional might connect to the
 	 * previous fd_server backlog.
 	 */
@@ -1171,7 +1127,7 @@ swap_in_extra_buffers(struct Global *g)
 
 /* We only re-build the extra buffers list, as requested from netmap. We don't
  * undo the swapping that we did at the start of the program to swap in the
- * extra buffer. This probably leaves the netmap adapter in an incosistent
+ * extra buffer. This probably leaves the netmap adapter in an inconsistent
  * state, that's why we only support this option for interfaces requested
  * directly.
  */
@@ -1375,7 +1331,7 @@ main(int argc, char **argv)
 
 		default:
 			verbose_print(g->verbosity_level, LV_ERROR_MSG,
-			              "Unrecognized option %c\n", opt);
+			              "Unrecognized option %c\n", optopt);
 			usage(stderr);
 			exit(EXIT_FAILURE);
 		}
@@ -1398,27 +1354,30 @@ main(int argc, char **argv)
 
 	if (g->request_from_fd_server == 0) {
 		/* We directly open the file descriptor. */
+		g->nmd = nmport_prepare(g->ifname);
+		if (g->nmd == NULL) {
+			verbose_perror(g->verbosity_level, LV_ERROR_MSG, g->ifname);
+			exit(EXIT_FAILURE);
+		}
 		if (g->extra_buffers_num > 0) {
-			struct nmreq req;
-
-			memset(&req, 0, sizeof(req));
-			req.nr_arg3 = g->extra_buffers_num;
-			g->nmd      = nm_open(g->ifname, &req, 0, NULL);
-		} else {
-			g->nmd = nm_open(g->ifname, NULL, 0, NULL);
+			g->nmd->reg.nr_extra_bufs = g->extra_buffers_num;
+		}
+		if (nmport_open_desc(g->nmd) < 0) {
+			verbose_perror(g->verbosity_level, LV_ERROR_MSG, g->ifname);
+			exit(EXIT_FAILURE);
 		}
 	} else {
 		g->nmd = get_if_fd(g, g->ifname);
 	}
 	if (g->nmd == NULL) {
 		verbose_print(g->verbosity_level, LV_ERROR_MSG,
-		              "Failed to nm_open(%s)\n", g->ifname);
+		              "Failed to nmport_open(%s)\n", g->ifname);
 		exit(EXIT_FAILURE);
 	}
 
 	if (g->extra_buffers_num > 0) {
 		/* Stores the real number of extra buffers. */
-		g->extra_buffers_num = g->nmd->req.nr_arg3;
+		g->extra_buffers_num = g->nmd->reg.nr_extra_bufs;
 		verbose_print(g->verbosity_level, LV_DEBUG_EXTRA_BUF, "Received %u extra buffers\n", g->extra_buffers_num);
 		ret = parse_extra_buffers_indexes(g);
 		if (ret == -1) {

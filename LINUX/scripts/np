@@ -90,10 +90,10 @@ function get-params {
 
 function need {
 	eval "local v=\${$1}"
-	[ -n "$v" -a -d "$v${2:+/$2}" ] || error "Variable $1 not set or not valid"
+	[ -n "$v" ] && [ -d "$v${2:+/$2}" ] || error "Variable $1 not set or not valid"
 }
 
-## The following enviroment variables must be set:
+## The following environment variables must be set:
 ##
 ##  GITDIR: the absolute path of the netmap linux
 ## 	git repository, containing all the required netmap-*
@@ -161,7 +161,7 @@ function get-patch()
 	local v2=$(scripts/vers $version -i -c)
 	local patchname=vanilla--$driver--$v1--$v2
 	local out=tmp-patches/$patchname
-	[ -n "$use_cache" -a -s $out ] && { echo $out; return; }
+	[ -n "$use_cache" ] && [ -s $out ] && { echo $out; return; }
 	local drvpath=$(driver-path $driver $version)
 	[ -n "$drvpath" ] || return
 	local drvdir=$(dirname $drvpath)
@@ -223,8 +223,8 @@ function get-src()
 
 ##
 ##  extend <patch> <version>
-##	checks wether the range of applicability of the 
-##	given <patch> can be extented to include <version>.
+##	checks whether the range of applicability of the
+##	given <patch> can be extended to include <version>.
 ##	It returns 0 on success and 1 on failure.
 function extend()
 {
@@ -280,12 +280,12 @@ function minimize()
 	# the original patches (in tmp-patches) are ordered by version number.
 	# We consider one patch in turn (the 'pivot') and try
 	# to extend its range to cover the range of the next
-	# patch. If this succedes, the merged patch is the new
+	# patch. If this succeeds, the merged patch is the new
 	# pivot, otherwise the current pivot is output and the
 	# next patch becomes the new pivot. The process
 	# is repeated until there are no more patches to consider.
 	local pivot=$1
-	[ -n "$pivot" -a -e "$pivot" ] || return 1
+	[ -n "$pivot" ] && [ -e "$pivot" ] || return 1
 	# extract the left end and right end of the pivot's range
 	local ple=$(scripts/vers $pivot -s -p -C)
 	local pre=$(scripts/vers $pivot -s -C)
@@ -306,7 +306,7 @@ function minimize()
 		# the patch in its final location
 		out=$(scripts/vers vanilla $drv $ple -c $pre -c -S4)
 		cp $pivot final-patches/$out
-		# the new pivot becames the next patch (if any)
+		# the new pivot becomes the next patch (if any)
 		pivot=$1
 		pre=$nre
 		ple=$nle
@@ -371,31 +371,51 @@ function build-prep()
 	get-params "version" "$@"
 
 	local dst=$(get-kernel $version)
+	local last
 
 	[ -f $dst/.build-prep ] && { echo $dst; return; }
 
 	(
 		cd $dst
-		[ -e include/linux/compiler-gcc5.h ] ||
-			ln -s compiler-gcc4.h include/linux/compiler-gcc5.h
-		[ -e include/linux/compiler-gcc6.h ] ||
-			ln -s compiler-gcc5.h include/linux/compiler-gcc6.h
-		[ -e include/linux/compiler-gcc7.h ] ||
-			ln -s compiler-gcc6.h include/linux/compiler-gcc7.h
-		# force disabling PIE
+		# fix for incompatible GNU make change
+		sed -i -e '/^squote/a\
+pound	:= \\#
+			/\<printf\>/{s/\\#/$(pound)/}' tools/build/Build.include || true
+		last=compiler-gcc.h
+		for i in $(seq 13); do
+			[ -e include/linux/compiler-gcc$i.h ] ||
+				ln -s $last include/linux/compiler-gcc$i.h
+			last=compiler-gcc$i.h
+		done
+		# force disabling PIE and fcf-protection
 		sed -i -e '/^all: vmlinux/a\
 \
 KBUILD_CFLAGS += $(call cc-option, -fno-pie)\
 KBUILD_CFLAGS += $(call cc-option, -no-pie)\
+KBUILD_CFLAGS += $(call cc-option, -fcf-protection=none)\
 KBUILD_AFLAGS += $(call cc-option, -fno-pie)\
 KBUILD_CPPFLAGS += $(call cc-option, -fno-pie)' Makefile
+		# remove duplicated yylloc definition, since gcc-10 defaults to -fno-common
+		sed -i -e '/^[[:blank:]]*YYLTYPE[[:blank:]][[:blank:]]*yylloc;[[:blank:]]*$/d' \
+			scripts/dtc/dtc-lexer*
+		# make sure per_cpu_load_addr is static
+		sed -i -e 's/^[[:blank:]]*Elf_Addr[[:blank:]][[:blank:]]*per_cpu_load_addr;/static &/' \
+			arch/x86/tools/relocs.c
 		if [ -f $LINUX_CONFIGS/config-$version ]; then
 			cp $LINUX_CONFIGS/config-$version .config
 			yes '' | make oldconfig
 		else
 			make allmodconfig
 		fi
-		make modules_prepare
+		# old kernels' selinux causes compilation failures with gcc >= 9
+		echo "CONFIG_SECURITY_SELINUX=n" >> .config
+		# workaround for some objtool/binutils incompatibility
+		sed -i -e 's/^CONFIG_UNWINDER_ORC=/#&/' .config
+		echo "CONFIG_UNWINDER_FRAME_POINTER=y" >> .config
+		yes '' | make oldconfig
+		# some tools do not compile with -Werror and gcc >= 9
+		sed -i 's/-Werror/-Wno-error/g' $(grep -Rl -- -Werror tools)
+		make scripts modules_prepare
 		touch .build-prep
 	) >$dst.log 2>&1 || error "build-prep failed for linux $version. Please check $dst.log"
 	echo $dst
@@ -415,12 +435,12 @@ function check-patch()
 	local v1=$(scripts/vers $_patch -s -p -C)
 	# extract the right version
 	local v2=$(scripts/vers $_patch -s -C)
-	# extract the uncoverted right version (might be 99999)
+	# extract the unconverted right version (might be 99999)
 	local end=$(scripts/vers $_patch -s)
 	# extract the driver name
 	local driver=$(scripts/vers $_patch -s -p -p)
 	# possibly extract the selected driver version
-	driver_version=${driver#*:}
+	driver_version=$(echo "$driver" | sed -n 's/^.*://p')
 	driver=${driver%%:*}
 	# extract the driver type (vanilla or external)
 	local dtype=$(scripts/vers $_patch -s -p -p -p)
@@ -436,7 +456,7 @@ function check-patch()
 
 	while scripts/vers -b $v1 $v2 -L; do
 		# cache lookup
-		local cache=$PWD/cache/$v1/$dtype-$driver${driver_version+:$driver_version}
+		local cache=$PWD/cache/$v1/$dtype-$driver${driver_version:+:$driver_version}
 		mkdir -p $cache
 		local cpatch=$cache/patch
 		local cnmcommit=$cache/nmcommit
@@ -495,14 +515,15 @@ function check-patch()
 				--disable-vale \
 				--disable-monitor \
 				--disable-ptnetmap \
+				--disable-null \
 				--no-apps \
 				--kernel-opts=CONFIG_STACK_VALIDATION= \
 				$config_opts \
 				--cache=$cache >>$log
-			(make get-$driver && make -j $PARALLEL_MAKE) >>$log 2>&1 && ok=true
+			(make get-$driver && KBUILD_MODPOST_WARN=1 make -j $PARALLEL_MAKE) >>$log 2>&1 && ok=true
 			grep -q warning: $log && { warn=true; echo $warn > $cwarn; }
 			cat config.log >>$log
-			cat netmap_linux_config.h >>$log
+			cat netmap_linux_config.h >>$log 2>/dev/null
 			popd >/dev/null
 			cp $log $clog
 		fi

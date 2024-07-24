@@ -47,16 +47,48 @@ char netmap_igb_driver_name[] = "igb" NETMAP_LINUX_DRIVER_SUFFIX;
  */
 #ifdef NETMAP_LINUX_HAVE_IGB_RD32
 #define READ_TDH(_adapter, _txr)	igb_rd32(&(_adapter)->hw, E1000_TDH((_txr)->reg_idx))
+#define READ_RCTL(_adapter, _rxr)	igb_rd32(&(_adapter)->hw, E1000_RXDCTL((_rxr)->reg_idx))
 #elif defined(E1000_READ_REG)
 #define READ_TDH(_adapter, _txr)	E1000_READ_REG(&(_adapter)->hw, E1000_TDH((_txr)->reg_idx))
+#define READ_RCTL(_adapter, _rxr)	E1000_READ_REG(&(_adapter)->hw, E1000_RXDCTL((_rxr)->reg_idx))
 #elif defined rd32
 static inline u32 READ_TDH(struct igb_adapter *adapter, struct igb_ring *txr)
 {
 	struct e1000_hw *hw = &adapter->hw;
 	return rd32(E1000_TDH(txr->reg_idx));
 }
+static inline u32 READ_RCTL(struct igb_adapter *adapter, struct igb_ring *rxr)
+{
+	struct e1000_hw *hw = &adapter->hw;
+	return rd32(E1000_RXDCTL(rxr->reg_idx));
+}
 #else
 #define	READ_TDH(_adapter, _txr)	readl((_txr)->head)
+#define	READ_RCTL(_adapter, _rxr)	readl(E1000_RXDCRL((_rxr)->reg_idx))
+#endif
+#ifdef E1000_WRITE_REG
+#define NM_WRITE_RCTL(_adapter, _rxr, _rxdctl)	\
+	E1000_WRITE_REG(&(_adapter)->hw, E1000_RXDCTL((_rxr)->reg_idx), (rxdctl))
+#define NM_WRITE_SRRCTL(_adapter, _rxr, _srrctl)	\
+	E1000_WRITE_REG(&(_adapter)->hw, E1000_SRRCTL((_rxr)->reg_idx), (srrctl))
+#elif defined(wr32)
+static inline void NM_WRITE_RCTL(struct igb_adapter *adapter, struct igb_ring *rxr,
+	u32 rxdctl)
+{
+	struct e1000_hw *hw = &adapter->hw;
+	wr32(E1000_RXDCTL(rxr->reg_idx), rxdctl);
+}
+static inline void NM_WRITE_SRRCTL(struct igb_adapter *adapter, struct igb_ring *rxr,
+	u32 srrctl)
+{
+	struct e1000_hw *hw = &adapter->hw;
+	wr32(E1000_SRRCTL(rxr->reg_idx), srrctl);
+}
+#else
+#define NM_WRITE_RCTL(_adapter, _rxr, _rxdctl)	\
+	writel(E1000_RCTL((_rxr)->reg_idx, (_rxdctl))
+#define NM_WRITE_SRRCTL(_adapter, _rxr, _srrctl)	\
+	writel(E1000_SRRCTL((_rxr)->reg_idx, (_srrctl))
 #endif
 
 #ifndef E1000_TX_DESC_ADV
@@ -69,6 +101,11 @@ static inline u32 READ_TDH(struct igb_adapter *adapter, struct igb_ring *txr)
 #define	rx_buffer_info			buffer_info
 #endif
 
+#ifdef NETMAP_LINUX_HAVE_IGB_STATE_INDIR
+#define NM_IGB_STATE(a_) (&(a_)->state)
+#else
+#define NM_IGB_STATE(a_) ((a_)->state)
+#endif /* NETMAP_LINUX_HAVE_IGB_STATE_INDIR */
 
 /*
  * Register/unregister. We are already under netmap lock.
@@ -81,7 +118,7 @@ igb_netmap_reg(struct netmap_adapter *na, int onoff)
 	struct SOFTC_T *adapter = netdev_priv(ifp);
 
 	/* protect against other reinit */
-	while (test_and_set_bit(__IGB_RESETTING, &adapter->state))
+	while (test_and_set_bit(__IGB_RESETTING, NM_IGB_STATE(adapter)))
 		usleep_range(1000, 2000);
 
 	if (netif_running(adapter->netdev))
@@ -98,7 +135,7 @@ igb_netmap_reg(struct netmap_adapter *na, int onoff)
 	else
 		igb_reset(adapter); // XXX is it needed ?
 
-	clear_bit(__IGB_RESETTING, &adapter->state);
+	clear_bit(__IGB_RESETTING, NM_IGB_STATE(adapter));
 	return (0);
 }
 
@@ -119,7 +156,7 @@ igb_netmap_txsync(struct netmap_kring *kring, int flags)
 	u_int const lim = kring->nkr_num_slots - 1;
 	u_int const head = kring->rhead;
 	/* generate an interrupt approximately every half ring */
-	u_int report_frequency = kring->nkr_num_slots >> 1;
+	u_int report_frequency = kring->nkr_num_slots >> 1, report;
 
 	/* device-specific */
 	struct SOFTC_T *adapter = netdev_priv(ifp);
@@ -134,39 +171,91 @@ igb_netmap_txsync(struct netmap_kring *kring, int flags)
 
 	nm_i = kring->nr_hwcur;
 	if (nm_i != head) {	/* we have new packets to send */
-		uint32_t olinfo_status=0;
-
 		nic_i = netmap_idx_k2n(kring, nm_i);
 		for (n = 0; nm_i != head; n++) {
 			struct netmap_slot *slot = &ring->slot[nm_i];
 			u_int len = slot->len;
 			uint64_t paddr;
 			void *addr = PNMB(na, slot, &paddr);
+			uint64_t offset = nm_get_offset(kring, slot);
 
 			/* device-specific */
 			union e1000_adv_tx_desc *curr =
 			    E1000_TX_DESC_ADV(*txr, nic_i);
-			int hw_flags = (slot->flags & NS_REPORT ||
-				nic_i == 0 || nic_i == report_frequency) ?
-				E1000_TXD_CMD_RS : 0;
+			int hw_flags = E1000_ADVTXD_DTYP_DATA |  E1000_ADVTXD_DCMD_DEXT |
+				E1000_ADVTXD_DCMD_IFCS;
+			u_int totlen = len;
 
-			NM_CHECK_ADDR_LEN(na, addr, len);
+			PNMB(na, slot, &paddr);
+			NM_CHECK_ADDR_LEN_OFF(na, len, offset);
 
-			if (!(slot->flags & NS_MOREFRAG)) {
-				hw_flags |= E1000_TXD_CMD_EOP;
+			report = slot->flags & NS_REPORT ||
+				nic_i == 0 ||
+				nic_i == report_frequency;
+			if (slot->flags & NS_MOREFRAG) {
+				/* There is some duplicated code here, but
+				 * mixing everything up in the outer loop makes
+				 * things less transparent, and it also adds
+				 * unnecessary instructions in the fast path
+				 */
+				union e1000_adv_tx_desc *first = curr;
+
+				first->read.buffer_addr = htole64(paddr + offset);
+				first->read.cmd_type_len = htole32(len | hw_flags);
+				netmap_sync_map_dev(na, (bus_dma_tag_t) na->pdev,
+						&paddr, len, NR_TX);
+				/* avoid setting the FCS flag in the
+				 * descriptors after the first, for safety
+				 */
+				hw_flags &= ~E1000_ADVTXD_DCMD_IFCS;
+				for (;;) {
+					nm_i = nm_next(nm_i, lim);
+					nic_i = nm_next(nic_i, lim);
+					/* remember that we have to ask for a
+					 * report each time we move past half a
+					 * ring
+					 */
+					report |= nic_i == 0 ||
+						nic_i == report_frequency;
+					if (nm_i == head) {
+						// XXX should we accept incomplete packets?
+						return EINVAL;
+					}
+					slot = &ring->slot[nm_i];
+					len = slot->len;
+					addr = PNMB(na, slot, &paddr);
+					PNMB(na, slot, &paddr);
+					offset = nm_get_offset(kring, slot);
+					NM_CHECK_ADDR_LEN_OFF(na, len, offset);
+					curr = E1000_TX_DESC_ADV(*txr, nic_i);
+					totlen += len;
+					if (!(slot->flags & NS_MOREFRAG))
+						break;
+					curr->read.buffer_addr = htole64(paddr + offset);
+					curr->read.olinfo_status = 0;
+					curr->read.cmd_type_len = htole32(len | hw_flags);
+
+					netmap_sync_map_dev(na, (bus_dma_tag_t) na->pdev,
+							&paddr, len, NR_TX);
+				}
+				first->read.olinfo_status =
+					htole32(totlen << E1000_ADVTXD_PAYLEN_SHIFT);
+				totlen = 0;
 			}
+			/* curr now always points to the last descriptor of a packet
+			 * (which is also the first for single-slot packets)
+			 *
+			 * EOP and RS must be set only in this descriptor.
+			 */
+			hw_flags |= E1000_TXD_CMD_EOP | (report ? E1000_TXD_CMD_RS : 0);
 			slot->flags &= ~(NS_REPORT | NS_BUF_CHANGED | NS_MOREFRAG);
-			netmap_sync_map_dev(na, (bus_dma_tag_t) na->pdev, &paddr, len, NR_TX);
 
 			/* Fill the slot in the NIC ring. */
-			curr->read.buffer_addr = htole64(paddr);
+			curr->read.buffer_addr = htole64(paddr + offset);
 			// XXX check olinfo and cmd_type_len
-			curr->read.olinfo_status =
-			    htole32(olinfo_status |
-				(len<< E1000_ADVTXD_PAYLEN_SHIFT));
-			curr->read.cmd_type_len = htole32(len | hw_flags |
-				E1000_ADVTXD_DTYP_DATA | E1000_ADVTXD_DCMD_DEXT |
-				E1000_ADVTXD_DCMD_IFCS);
+			curr->read.olinfo_status = htole32(totlen<< E1000_ADVTXD_PAYLEN_SHIFT);
+			curr->read.cmd_type_len = htole32(len | hw_flags);
+			netmap_sync_map_dev(na, (bus_dma_tag_t) na->pdev, &paddr, len, NR_TX);
 			nm_i = nm_next(nm_i, lim);
 			nic_i = nm_next(nic_i, lim);
 		}
@@ -176,7 +265,7 @@ igb_netmap_txsync(struct netmap_kring *kring, int flags)
 
 		/* (re)start the tx unit up to slot nic_i (excluded) */
 		writel(nic_i, txr->tail);
-		mmiowb();
+		wmb();
 	}
 
 	/*
@@ -187,8 +276,8 @@ igb_netmap_txsync(struct netmap_kring *kring, int flags)
 
 		/* record completed transmissions using TDH */
 		nic_i = READ_TDH(adapter, txr);
-		if (nic_i >= kring->nkr_num_slots) { /* XXX can it happen ? */
-			D("TDH wrap %d", nic_i);
+		if (unlikely(nic_i >= kring->nkr_num_slots)) {
+			nm_prerr("TDH wrap at idx %d", nic_i);
 			nic_i -= kring->nkr_num_slots;
 		}
 		nm_i = netmap_idx_n2k(kring, nic_i);
@@ -197,7 +286,7 @@ igb_netmap_txsync(struct netmap_kring *kring, int flags)
 		for ( ; tosync != nm_i; tosync = nm_next(tosync, lim)) {
 			struct netmap_slot *slot = &ring->slot[tosync];
 			uint64_t paddr;
-			(void)PNMB(na, slot, &paddr);
+			(void)PNMB_O(kring, slot, &paddr);
 
 			netmap_sync_map_cpu(na, (bus_dma_tag_t) na->pdev,
 					&paddr, slot->len, NR_TX);
@@ -226,7 +315,6 @@ igb_netmap_rxsync(struct netmap_kring *kring, int flags)
 	u_int const lim = kring->nkr_num_slots - 1;
 	u_int const head = kring->rhead;
 	int force_update = (flags & NAF_FORCE_READ) || kring->nr_kflags & NKR_PENDINTR;
-
 	/* device-specific */
 	struct SOFTC_T *adapter = netdev_priv(ifp);
 	struct igb_ring *rxr = adapter->rx_ring[ring_nr];
@@ -243,6 +331,8 @@ igb_netmap_rxsync(struct netmap_kring *kring, int flags)
 	 * First part: import newly received packets.
 	 */
 	if (netmap_no_pendintr || force_update) {
+		u_int new_hwtail = (u_int)-1;
+
 		nic_i = rxr->next_to_clean;
 		nm_i = netmap_idx_n2k(kring, nic_i);
 
@@ -252,23 +342,29 @@ igb_netmap_rxsync(struct netmap_kring *kring, int flags)
 			uint32_t staterr = le32toh(curr->wb.upper.status_error);
 			struct netmap_slot *slot = &ring->slot[nm_i];
 			uint64_t paddr;
+			int complete;
 
 			if ((staterr & E1000_RXD_STAT_DD) == 0)
 				break;
 			dma_rmb(); /* read descriptor after status DD */
-			PNMB(na, slot, &paddr);
+			PNMB_O(kring, slot, &paddr);
 			slot->len = le16toh(curr->wb.upper.length);
-			slot->flags = (!(staterr & E1000_RXD_STAT_EOP) ? NS_MOREFRAG : 0);
+			complete = (staterr & E1000_RXD_STAT_EOP);
+			slot->flags = complete ? 0 : NS_MOREFRAG;
 			netmap_sync_map_cpu(na, (bus_dma_tag_t) na->pdev, &paddr, slot->len, NR_RX);
 			nm_i = nm_next(nm_i, lim);
 			nic_i = nm_next(nic_i, lim);
+
+			if (complete)
+				new_hwtail = nm_i;
 		}
 		if (n) { /* update the state variables */
 			rxr->next_to_clean = nic_i;
 #ifdef NETMAP_LINUX_HAVE_IGB_NTA
 			rxr->next_to_alloc = nic_i;
 #endif /* NETMAP_LINUX_HAVE_IGB_NTA */
-			kring->nr_hwtail = nm_i;
+			if (new_hwtail != (u_int)-1)
+				kring->nr_hwtail = nm_i;
 		}
 		kring->nr_kflags &= ~NKR_PENDINTR;
 	}
@@ -283,6 +379,7 @@ igb_netmap_rxsync(struct netmap_kring *kring, int flags)
 			struct netmap_slot *slot = &ring->slot[nm_i];
 			uint64_t paddr;
 			void *addr = PNMB(na, slot, &paddr);
+			uint64_t offset = nm_get_offset(kring, slot);
 			union e1000_adv_rx_desc *curr = E1000_RX_DESC_ADV(*rxr, nic_i);
 
 			if (addr == NETMAP_BUF_BASE(na)) /* bad buf */
@@ -293,7 +390,7 @@ igb_netmap_rxsync(struct netmap_kring *kring, int flags)
 			}
 			netmap_sync_map_dev(na, (bus_dma_tag_t) na->pdev,
 					&paddr, NETMAP_BUF_SIZE(na), NR_RX);
-			curr->read.pkt_addr = htole64(paddr);
+			curr->read.pkt_addr = htole64(paddr + offset);
 			curr->read.hdr_addr = 0;
 			nm_i = nm_next(nm_i, lim);
 			nic_i = nm_next(nic_i, lim);
@@ -322,23 +419,51 @@ igb_netmap_configure_tx_ring(struct SOFTC_T *adapter, int ring_nr)
 	struct ifnet *ifp = adapter->netdev;
 	struct netmap_adapter* na = NA(ifp);
 	struct netmap_slot* slot;
-	struct igb_ring *txr = adapter->tx_ring[ring_nr];
-	int i, si;
-	void *addr;
-	uint64_t paddr;
 
 	slot = netmap_reset(na, NR_TX, ring_nr, 0);
 	if (!slot)
 		return 0;  // not in netmap native mode
-	for (i = 0; i < na->num_tx_desc; i++) {
-		union e1000_adv_tx_desc *tx_desc;
-		si = netmap_idx_n2k(na->tx_rings[ring_nr], i);
-		addr = PNMB(na, slot + si, &paddr);
-		tx_desc = E1000_TX_DESC_ADV(*txr, i);
-		tx_desc->read.buffer_addr = htole64(paddr);
-		/* actually we don't care to init the rings here */
-	}
+
+	/* no need to fill the tx rings, since txsync will
+	 * always overwrite the tx slots
+	 */
+
 	return 1;	// success
+}
+
+static int
+igb_netmap_bufcfg(struct netmap_kring *kring, uint64_t target)
+{
+	if (kring->tx == NR_TX) {
+		kring->hwbuf_len = target;
+		return 0;
+	}
+
+	target >>= 10;
+	if (target >= 1 && target <= 16) {
+		target <<= 10;
+	} else {
+		return EINVAL;
+	}
+	kring->hwbuf_len = target;
+	kring->buf_align = 0; /* no alignment */
+	nm_prinf("%s: hwbuf_len %llu", kring->name, kring->hwbuf_len);
+	return 0;
+}
+
+static void
+igb_netmap_configure_srrctl(struct igb_ring *rxr)
+{
+	struct ifnet *ifp = rxr->netdev;
+	struct netmap_adapter* na = NA(ifp);
+	struct igb_adapter *adapter = netdev_priv(ifp);
+	struct netmap_kring *kring = na->rx_rings[rxr->reg_idx];
+	u32 srrctl;
+
+	srrctl = kring->hwbuf_len >> E1000_SRRCTL_BSIZEPKT_SHIFT;
+	srrctl |= E1000_SRRCTL_DESCTYPE_ADV_ONEBUF;
+	srrctl |= E1000_SRRCTL_DROP_EN;
+	NM_WRITE_SRRCTL(adapter, rxr, srrctl);
 }
 
 
@@ -349,7 +474,8 @@ igb_netmap_configure_rx_ring(struct igb_ring *rxr)
 	struct netmap_adapter* na = NA(ifp);
 	int reg_idx = rxr->reg_idx;
 	struct netmap_slot* slot;
-	u_int i;
+	struct netmap_kring *kring;
+	u_int i, n;
 
 	/*
 	 * XXX watch out, the main driver must not use
@@ -365,54 +491,38 @@ igb_netmap_configure_rx_ring(struct igb_ring *rxr)
 	if (!slot)
 		return 0;	// not in native netmap mode
 
-	for (i = 0; i < rxr->count; i++) {
+	igb_netmap_configure_srrctl(rxr);
+
+	kring = na->rx_rings[reg_idx];
+	/* preserve buffers already made available to clients */
+	n = rxr->count - 1 - nm_kr_rxspace(na->rx_rings[reg_idx]);
+	for (i = 0; i <= n; i++) {
 		union e1000_adv_rx_desc *rx_desc;
 		uint64_t paddr;
-		int si = netmap_idx_n2k(na->rx_rings[reg_idx], i);
+		int si = netmap_idx_n2k(kring, i);
 
-#if 0
-		// XXX the skb check can go away
-		struct igb_rx_buffer *bi = &rxr->rx_buffer_info[i];
-		if (bi->skb)
-			D("rx buf %d was set", i);
-		bi->skb = NULL; // XXX leak if set
-#endif /* useless */
-
-		PNMB(na, slot + si, &paddr);
+		PNMB_O(kring, slot + si, &paddr);
 		rx_desc = E1000_RX_DESC_ADV(*rxr, i);
 		rx_desc->read.hdr_addr = 0;
 		rx_desc->read.pkt_addr = htole64(paddr);
 	}
-	/* preserve buffers already made available to clients */
-	i = rxr->count - 1 - nm_kr_rxspace(na->rx_rings[reg_idx]);
 
 	wmb();	/* Force memory writes to complete */
-	ND("%s rxr%d.tail %d", na->name, reg_idx, i);
-	writel(i, rxr->tail);
+	nm_prdis("%s rxr%d.tail %d", na->name, reg_idx, i);
+	writel(n, rxr->tail);
 	return 1;	// success
-}
-
-static unsigned
-nm_igb_rx_buf_maxsize(struct SOFTC_T *adapter)
-{
-#if defined(NETMAP_LINUX_HAVE_IGB_RX_BUFSZ)
-	return igb_rx_bufsz(adapter->rx_ring[0]);
-#else  /* !NETMAP_LINUX_HAVE_IGB_RX_BUFSZ */
-	return 3072; /* stay on the safe side */
-#endif /* !NETMAP_LINUX_HAVE_IGB_RX_BUFSZ */
 }
 
 static int
 igb_netmap_config(struct netmap_adapter *na, struct nm_config_info *info)
 {
-	struct SOFTC_T *adapter = netdev_priv(na->ifp);
 	int ret = netmap_rings_config_get(na, info);
 
 	if (ret) {
 		return ret;
 	}
 
-	info->rx_buf_maxsize = nm_igb_rx_buf_maxsize(adapter);
+	info->rx_buf_maxsize = NETMAP_BUF_SIZE(na);
 
 	return 0;
 }
@@ -427,16 +537,17 @@ igb_netmap_attach(struct SOFTC_T *adapter)
 
 	na.ifp = adapter->netdev;
 	na.pdev = &adapter->pdev->dev;
-	na.na_flags = NAF_MOREFRAG;
+	na.na_flags = NAF_MOREFRAG | NAF_OFFSETS;
 	na.num_tx_desc = adapter->tx_ring_count;
 	na.num_rx_desc = adapter->rx_ring_count;
 	na.num_tx_rings = adapter->num_tx_queues;
 	na.num_rx_rings = adapter->num_rx_queues;
-	na.rx_buf_maxsize = nm_igb_rx_buf_maxsize(adapter);
+	na.rx_buf_maxsize = 1500; /* will be overwritten by config */
 	na.nm_register = igb_netmap_reg;
 	na.nm_txsync = igb_netmap_txsync;
 	na.nm_rxsync = igb_netmap_rxsync;
 	na.nm_config = igb_netmap_config;
+	na.nm_bufcfg = igb_netmap_bufcfg;
 	netmap_attach(&na);
 }
 

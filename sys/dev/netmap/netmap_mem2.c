@@ -1,4 +1,6 @@
-/*
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
+ *
  * Copyright (C) 2012-2014 Matteo Landi
  * Copyright (C) 2012-2016 Luigi Rizzo
  * Copyright (C) 2012-2016 Giuseppe Lettieri
@@ -36,7 +38,7 @@
 
 #ifdef __FreeBSD__
 #include <sys/cdefs.h> /* prerequisite */
-__FBSDID("$FreeBSD: head/sys/dev/netmap/netmap.c 241723 2012-10-19 09:41:45Z glebius $");
+__FBSDID("$FreeBSD$");
 
 #include <sys/types.h>
 #include <sys/malloc.h>
@@ -98,16 +100,17 @@ struct netmap_obj_pool {
 	/* ---------------------------------------------------*/
 	/* these are only meaningful if the pool is finalized */
 	/* (see 'finalized' field in netmap_mem_d)            */
-	u_int objtotal;         /* actual total number of objects. */
-	u_int memtotal;		/* actual total memory space */
-	u_int numclusters;	/* actual number of clusters */
-
-	u_int objfree;          /* number of free objects. */
+	size_t memtotal;	/* actual total memory space */
 
 	struct lut_entry *lut;  /* virt,phys addresses, objtotal entries */
 	uint32_t *bitmap;       /* one bit per buffer, 1 means free */
 	uint32_t *invalid_bitmap;/* one bit per buffer, 1 means invalid */
 	uint32_t bitmap_slots;	/* number of uint32 entries in bitmap */
+
+	u_int objtotal;         /* actual total number of objects. */
+	u_int numclusters;	/* actual number of clusters */
+	u_int objfree;          /* number of free objects. */
+
 	int	alloc_done;	/* we have allocated the memory */
 	/* ---------------------------------------------------*/
 
@@ -143,25 +146,29 @@ struct netmap_mem_ops {
 
 	vm_paddr_t (*nmd_ofstophys)(struct netmap_mem_d *, vm_ooffset_t);
 	int (*nmd_config)(struct netmap_mem_d *);
-	int (*nmd_finalize)(struct netmap_mem_d *);
-	void (*nmd_deref)(struct netmap_mem_d *);
+	int (*nmd_finalize)(struct netmap_mem_d *, struct netmap_adapter *);
+	void (*nmd_deref)(struct netmap_mem_d *, struct netmap_adapter *);
 	ssize_t  (*nmd_if_offset)(struct netmap_mem_d *, const void *vaddr);
 	void (*nmd_delete)(struct netmap_mem_d *);
 
-	struct netmap_if * (*nmd_if_new)(struct netmap_adapter *,
-					 struct netmap_priv_d *);
-	void (*nmd_if_delete)(struct netmap_adapter *, struct netmap_if *);
-	int  (*nmd_rings_create)(struct netmap_adapter *);
-	void (*nmd_rings_delete)(struct netmap_adapter *);
+	struct netmap_if * (*nmd_if_new)(struct netmap_mem_d *,
+			struct netmap_adapter *, struct netmap_priv_d *);
+	void (*nmd_if_delete)(struct netmap_mem_d *,
+			struct netmap_adapter *, struct netmap_if *);
+	int  (*nmd_rings_create)(struct netmap_mem_d *,
+			struct netmap_adapter *);
+	void (*nmd_rings_delete)(struct netmap_mem_d *,
+			struct netmap_adapter *);
 };
 
 struct netmap_mem_d {
 	NMA_LOCK_T nm_mtx;  /* protect the allocator */
-	u_int nm_totalsize; /* shorthand */
+	size_t nm_totalsize; /* shorthand */
 
 	u_int flags;
 #define NETMAP_MEM_FINALIZED	0x1	/* preallocation done */
-#define NETMAP_MEM_HIDDEN	0x8	/* beeing prepared */
+#define NETMAP_MEM_HIDDEN	0x8	/* being prepared */
+#define NETMAP_MEM_NOMAP	0x10	/* do not map/unmap pdevs */
 	int lasterr;		/* last error for curr config */
 	int active;		/* active users */
 	int refcount;
@@ -169,7 +176,7 @@ struct netmap_mem_d {
 	struct netmap_obj_pool pools[NETMAP_POOLS_NR];
 
 	nm_memid_t nm_id;	/* allocator identifier */
-	int nm_grp;	/* iommu groupd id */
+	int nm_grp;	/* iommu group id */
 
 	/* list of all existing allocators, sorted by nm_id */
 	struct netmap_mem_d *prev, *next;
@@ -264,7 +271,7 @@ netmap_mem_if_new(struct netmap_adapter *na, struct netmap_priv_d *priv)
 	struct netmap_mem_d *nmd = na->nm_mem;
 
 	NMA_LOCK(nmd);
-	nifp = nmd->ops->nmd_if_new(na, priv);
+	nifp = nmd->ops->nmd_if_new(nmd, na, priv);
 	NMA_UNLOCK(nmd);
 
 	return nifp;
@@ -276,7 +283,7 @@ netmap_mem_if_delete(struct netmap_adapter *na, struct netmap_if *nif)
 	struct netmap_mem_d *nmd = na->nm_mem;
 
 	NMA_LOCK(nmd);
-	nmd->ops->nmd_if_delete(na, nif);
+	nmd->ops->nmd_if_delete(nmd, na, nif);
 	NMA_UNLOCK(nmd);
 }
 
@@ -287,7 +294,7 @@ netmap_mem_rings_create(struct netmap_adapter *na)
 	struct netmap_mem_d *nmd = na->nm_mem;
 
 	NMA_LOCK(nmd);
-	rv = nmd->ops->nmd_rings_create(na);
+	rv = nmd->ops->nmd_rings_create(nmd, na);
 	NMA_UNLOCK(nmd);
 
 	return rv;
@@ -299,13 +306,13 @@ netmap_mem_rings_delete(struct netmap_adapter *na)
 	struct netmap_mem_d *nmd = na->nm_mem;
 
 	NMA_LOCK(nmd);
-	nmd->ops->nmd_rings_delete(na);
+	nmd->ops->nmd_rings_delete(nmd, na);
 	NMA_UNLOCK(nmd);
 }
 
 static int netmap_mem_map(struct netmap_obj_pool *, struct netmap_adapter *);
 static int netmap_mem_unmap(struct netmap_obj_pool *, struct netmap_adapter *);
-static int nm_mem_assign_group(struct netmap_mem_d *, struct device *);
+static int nm_mem_check_group(struct netmap_mem_d *, bus_dma_tag_t);
 static void nm_mem_release_id(struct netmap_mem_d *);
 
 nm_memid_t
@@ -316,14 +323,14 @@ netmap_mem_get_id(struct netmap_mem_d *nmd)
 
 #ifdef NM_DEBUG_MEM_PUTGET
 #define NM_DBG_REFC(nmd, func, line)	\
-	nm_prinf("%s:%d mem[%d] -> %d\n", func, line, (nmd)->nm_id, (nmd)->refcount);
+	nm_prinf("%s:%d mem[%d:%d] -> %d", func, line, (nmd)->nm_id, (nmd)->nm_grp, (nmd)->refcount);
 #else
 #define NM_DBG_REFC(nmd, func, line)
 #endif
 
 /* circular list of all existing allocators */
 static struct netmap_mem_d *netmap_last_mem_d = &nm_mem;
-NM_MTX_T nm_mem_list_lock;
+static NM_MTX_T nm_mem_list_lock;
 
 struct netmap_mem_d *
 __netmap_mem_get(struct netmap_mem_d *nmd, const char *func, int line)
@@ -353,7 +360,7 @@ int
 netmap_mem_finalize(struct netmap_mem_d *nmd, struct netmap_adapter *na)
 {
 	int lasterr = 0;
-	if (nm_mem_assign_group(nmd, na->pdev) < 0) {
+	if (nm_mem_check_group(nmd, na->pdev) < 0) {
 		return ENOMEM;
 	}
 
@@ -364,9 +371,9 @@ netmap_mem_finalize(struct netmap_mem_d *nmd, struct netmap_adapter *na)
 
 	nmd->active++;
 
-	nmd->lasterr = nmd->ops->nmd_finalize(nmd);
+	nmd->lasterr = nmd->ops->nmd_finalize(nmd, na);
 
-	if (!nmd->lasterr && na->pdev) {
+	if (!nmd->lasterr && !(nmd->flags & NETMAP_MEM_NOMAP)) {
 		nmd->lasterr = netmap_mem_map(&nmd->pools[NETMAP_BUF_POOL], na);
 	}
 
@@ -395,15 +402,15 @@ netmap_init_obj_allocator_bitmap(struct netmap_obj_pool *p)
 	if (p->bitmap == NULL) {
 		/* Allocate the bitmap */
 		n = (p->objtotal + 31) / 32;
-		p->bitmap = nm_os_malloc(sizeof(uint32_t) * n);
+		p->bitmap = nm_os_malloc(sizeof(p->bitmap[0]) * n);
 		if (p->bitmap == NULL) {
-			D("Unable to create bitmap (%d entries) for allocator '%s'", (int)n,
+			nm_prerr("Unable to create bitmap (%d entries) for allocator '%s'", (int)n,
 			    p->name);
 			return ENOMEM;
 		}
 		p->bitmap_slots = n;
 	} else {
-		memset(p->bitmap, 0, p->bitmap_slots);
+		memset(p->bitmap, 0, p->bitmap_slots * sizeof(p->bitmap[0]));
 	}
 
 	p->objfree = 0;
@@ -414,16 +421,21 @@ netmap_init_obj_allocator_bitmap(struct netmap_obj_pool *p)
 	 */
 	for (j = 0; j < p->objtotal; j++) {
 		if (p->invalid_bitmap && nm_isset(p->invalid_bitmap, j)) {
-			D("skipping %s %d", p->name, j);
+			if (netmap_debug & NM_DEBUG_MEM)
+				nm_prinf("skipping %s %d", p->name, j);
 			continue;
 		}
 		p->bitmap[ (j>>5) ] |=  ( 1U << (j & 31U) );
 		p->objfree++;
 	}
 
-	ND("%s free %u", p->name, p->objfree);
-	if (p->objfree == 0)
+	if (netmap_verbose)
+		nm_prinf("%s free %u", p->name, p->objfree);
+	if (p->objfree == 0) {
+		if (netmap_verbose)
+			nm_prerr("%s: no objects available", p->name);
 		return ENOMEM;
+	}
 
 	return 0;
 }
@@ -445,6 +457,7 @@ netmap_mem_init_bitmaps(struct netmap_mem_d *nmd)
 	 * buffers 0 and 1 are reserved
 	 */
 	if (nmd->pools[NETMAP_BUF_POOL].objfree < 2) {
+		nm_prerr("%s: not enough buffers", nmd->pools[NETMAP_BUF_POOL].name);
 		return ENOMEM;
 	}
 
@@ -464,7 +477,7 @@ netmap_mem_deref(struct netmap_mem_d *nmd, struct netmap_adapter *na)
 {
 	int last_user = 0;
 	NMA_LOCK(nmd);
-	if (na->active_fds <= 0)
+	if (na->active_fds <= 0 && !(nmd->flags & NETMAP_MEM_NOMAP))
 		netmap_mem_unmap(&nmd->pools[NETMAP_BUF_POOL], na);
 	if (nmd->active == 1) {
 		last_user = 1;
@@ -475,11 +488,12 @@ netmap_mem_deref(struct netmap_mem_d *nmd, struct netmap_adapter *na)
 		 */
 		netmap_mem_init_bitmaps(nmd);
 	}
-	nmd->ops->nmd_deref(nmd);
+	nmd->ops->nmd_deref(nmd, na);
 
 	nmd->active--;
-	if (!nmd->active)
-		nmd->nm_grp = -1;
+	if (last_user) {
+		nmd->lasterr = 0;
+	}
 
 	NMA_UNLOCK(nmd);
 	return last_user;
@@ -573,6 +587,7 @@ struct netmap_mem_d nm_mem = {	/* Our memory allocator. */
 	.name = "1"
 };
 
+static struct netmap_mem_d nm_mem_blueprint;
 
 /* blueprint for the private memory allocators */
 /* XXX clang is not happy about using name as a print format */
@@ -638,7 +653,7 @@ DECLARE_SYSCTLS(NETMAP_BUF_POOL, buf);
 
 /* call with nm_mem_list_lock held */
 static int
-nm_mem_assign_id_locked(struct netmap_mem_d *nmd)
+nm_mem_assign_id_locked(struct netmap_mem_d *nmd, int grp_id)
 {
 	nm_memid_t id;
 	struct netmap_mem_d *scan = netmap_last_mem_d;
@@ -652,6 +667,7 @@ nm_mem_assign_id_locked(struct netmap_mem_d *nmd)
 		scan = scan->next;
 		if (id != scan->nm_id) {
 			nmd->nm_id = id;
+			nmd->nm_grp = grp_id;
 			nmd->prev = scan->prev;
 			nmd->next = scan;
 			scan->prev->next = nmd;
@@ -669,12 +685,12 @@ nm_mem_assign_id_locked(struct netmap_mem_d *nmd)
 
 /* call with nm_mem_list_lock *not* held */
 static int
-nm_mem_assign_id(struct netmap_mem_d *nmd)
+nm_mem_assign_id(struct netmap_mem_d *nmd, int grp_id)
 {
 	int ret;
 
 	NM_MTX_LOCK(nm_mem_list_lock);
-	ret = nm_mem_assign_id_locked(nmd);
+	ret = nm_mem_assign_id_locked(nmd, grp_id);
 	NM_MTX_UNLOCK(nm_mem_list_lock);
 
 	return ret;
@@ -714,20 +730,27 @@ netmap_mem_find(nm_memid_t id)
 }
 
 static int
-nm_mem_assign_group(struct netmap_mem_d *nmd, struct device *dev)
+nm_mem_check_group(struct netmap_mem_d *nmd, bus_dma_tag_t dev)
 {
 	int err = 0, id;
+
+	/* Skip not hw adapters.
+	 * Vale port can use particular allocator through vale-ctl -m option
+	 */
+	if (!dev)
+		return 0;
 	id = nm_iommu_group_id(dev);
-	if (netmap_verbose)
-		D("iommu_group %d", id);
+	if (netmap_debug & NM_DEBUG_MEM)
+		nm_prinf("iommu_group %d", id);
 
 	NMA_LOCK(nmd);
 
-	if (nmd->nm_grp < 0)
-		nmd->nm_grp = id;
-
-	if (nmd->nm_grp != id)
+	if (nmd->nm_grp != id) {
+		if (netmap_verbose)
+			nm_prerr("iommu group mismatch: %d vs %d",
+					nmd->nm_grp, id);
 		nmd->lasterr = err = ENOMEM;
+	}
 
 	NMA_UNLOCK(nmd);
 	return err;
@@ -803,7 +826,7 @@ netmap_mem2_ofstophys(struct netmap_mem_d* nmd, vm_ooffset_t offset)
 		return pa;
 	}
 	/* this is only in case of errors */
-	D("invalid ofs 0x%x out of 0x%x 0x%x 0x%x", (u_int)o,
+	nm_prerr("invalid ofs 0x%x out of 0x%zx 0x%zx 0x%zx", (u_int)o,
 		p[NETMAP_IF_POOL].memtotal,
 		p[NETMAP_IF_POOL].memtotal
 			+ p[NETMAP_RING_POOL].memtotal,
@@ -833,7 +856,7 @@ netmap_mem2_ofstophys(struct netmap_mem_d* nmd, vm_ooffset_t offset)
  *
  *		2a - cycle all the objects in every pool, get the list
  *				of the physical address descriptors
- *		2b - calculate the offset in the array of pages desciptor in the
+ *		2b - calculate the offset in the array of pages descriptor in the
  *				main MDL
  *		2c - copy the descriptors of the object in the main MDL
  *
@@ -852,13 +875,13 @@ win32_build_user_vm_map(struct netmap_mem_d* nmd)
 	int i, j;
 
 	if (netmap_mem_get_info(nmd, &memsize, &memflags, NULL)) {
-		D("memory not finalised yet");
+		nm_prerr("memory not finalised yet");
 		return NULL;
 	}
 
 	mainMdl = IoAllocateMdl(NULL, memsize, FALSE, FALSE, NULL);
 	if (mainMdl == NULL) {
-		D("failed to allocate mdl");
+		nm_prerr("failed to allocate mdl");
 		return NULL;
 	}
 
@@ -874,7 +897,7 @@ win32_build_user_vm_map(struct netmap_mem_d* nmd)
 		tempMdl = IoAllocateMdl(p->lut[0].vaddr, clsz, FALSE, FALSE, NULL);
 		if (tempMdl == NULL) {
 			NMA_UNLOCK(nmd);
-			D("fail to allocate tempMdl");
+			nm_prerr("fail to allocate tempMdl");
 			IoFreeMdl(mainMdl);
 			return NULL;
 		}
@@ -933,7 +956,7 @@ netmap_mem2_get_info(struct netmap_mem_d* nmd, uint64_t* size,
 			*size = 0;
 			for (i = 0; i < NETMAP_POOLS_NR; i++) {
 				struct netmap_obj_pool *p = nmd->pools + i;
-				*size += (p->_numclusters * p->_clustsize);
+				*size += ((size_t)p->_numclusters * (size_t)p->_clustsize);
 			}
 		}
 	}
@@ -965,11 +988,11 @@ netmap_obj_offset(struct netmap_obj_pool *p, const void *vaddr)
 			continue;
 
 		ofs = ofs + relofs;
-		ND("%s: return offset %d (cluster %d) for pointer %p",
+		nm_prdis("%s: return offset %d (cluster %d) for pointer %p",
 		    p->name, ofs, i, vaddr);
 		return ofs;
 	}
-	D("address %p is not contained inside any cluster (%s)",
+	nm_prerr("address %p is not contained inside any cluster (%s)",
 	    vaddr, p->name);
 	return 0; /* An error occurred */
 }
@@ -1000,12 +1023,12 @@ netmap_obj_malloc(struct netmap_obj_pool *p, u_int len, uint32_t *start, uint32_
 	void *vaddr = NULL;
 
 	if (len > p->_objsize) {
-		D("%s request size %d too large", p->name, len);
+		nm_prerr("%s request size %d too large", p->name, len);
 		return NULL;
 	}
 
 	if (p->objfree == 0) {
-		D("no more %s objects", p->name);
+		nm_prerr("no more %s objects", p->name);
 		return NULL;
 	}
 	if (start)
@@ -1029,7 +1052,7 @@ netmap_obj_malloc(struct netmap_obj_pool *p, u_int len, uint32_t *start, uint32_
 		if (index)
 			*index = i * 32 + j;
 	}
-	ND("%s allocator: allocated object @ [%d][%d]: vaddr %p",p->name, i, j, vaddr);
+	nm_prdis("%s allocator: allocated object @ [%d][%d]: vaddr %p",p->name, i, j, vaddr);
 
 	if (start)
 		*start = i;
@@ -1047,13 +1070,13 @@ netmap_obj_free(struct netmap_obj_pool *p, uint32_t j)
 	uint32_t *ptr, mask;
 
 	if (j >= p->objtotal) {
-		D("invalid index %u, max %u", j, p->objtotal);
+		nm_prerr("invalid index %u, max %u", j, p->objtotal);
 		return 1;
 	}
 	ptr = &p->bitmap[j / 32];
 	mask = (1 << (j % 32));
 	if (*ptr & mask) {
-		D("ouch, double free on buffer %d", j);
+		nm_prerr("ouch, double free on buffer %d", j);
 		return 1;
 	} else {
 		*ptr |= mask;
@@ -1084,7 +1107,7 @@ netmap_obj_free_va(struct netmap_obj_pool *p, void *vaddr)
 		netmap_obj_free(p, j);
 		return;
 	}
-	D("address %p is not contained inside any cluster (%s)",
+	nm_prerr("address %p is not contained inside any cluster (%s)",
 	    vaddr, p->name);
 }
 
@@ -1125,11 +1148,11 @@ netmap_extra_alloc(struct netmap_adapter *na, uint32_t *head, uint32_t n)
 		uint32_t cur = *head;	/* save current head */
 		uint32_t *p = netmap_buf_malloc(nmd, &pos, head);
 		if (p == NULL) {
-			D("no more buffers after %d of %d", i, n);
+			nm_prerr("no more buffers after %d of %d", i, n);
 			*head = cur; /* restore */
 			break;
 		}
-		ND(5, "allocate buffer %d -> %d", *head, cur);
+		nm_prdis(5, "allocate buffer %d -> %d", *head, cur);
 		*p = cur; /* link to previous head */
 	}
 
@@ -1146,7 +1169,7 @@ netmap_extra_free(struct netmap_adapter *na, uint32_t head)
 	struct netmap_obj_pool *p = &nmd->pools[NETMAP_BUF_POOL];
 	uint32_t i, cur, *buf;
 
-	ND("freeing the extra list");
+	nm_prdis("freeing the extra list");
 	for (i = 0; head >=2 && head < p->objtotal; i++) {
 		cur = head;
 		buf = lut[head].vaddr;
@@ -1156,9 +1179,9 @@ netmap_extra_free(struct netmap_adapter *na, uint32_t head)
 			break;
 	}
 	if (head != 0)
-		D("breaking with head %d", head);
-	if (netmap_verbose)
-		D("freed %d buffers", i);
+		nm_prerr("breaking with head %d", head);
+	if (netmap_debug & NM_DEBUG_MEM)
+		nm_prinf("freed %d buffers", i);
 }
 
 
@@ -1174,7 +1197,7 @@ netmap_new_bufs(struct netmap_mem_d *nmd, struct netmap_slot *slot, u_int n)
 	for (i = 0; i < n; i++) {
 		void *vaddr = netmap_buf_malloc(nmd, &pos, &index);
 		if (vaddr == NULL) {
-			D("no more buffers after %d of %d", i, n);
+			nm_prerr("no more buffers after %d of %d", i, n);
 			goto cleanup;
 		}
 		slot[i].buf_idx = index;
@@ -1183,7 +1206,7 @@ netmap_new_bufs(struct netmap_mem_d *nmd, struct netmap_slot *slot, u_int n)
 		slot[i].ptr = 0;
 	}
 
-	ND("%s: allocated %d buffers, %d available, first at %d", p->name, n, p->objfree, pos);
+	nm_prdis("%s: allocated %d buffers, %d available, first at %d", p->name, n, p->objfree, pos);
 	return (0);
 
 cleanup:
@@ -1215,7 +1238,7 @@ netmap_free_buf(struct netmap_mem_d *nmd, uint32_t i)
 	struct netmap_obj_pool *p = &nmd->pools[NETMAP_BUF_POOL];
 
 	if (i < 2 || i >= p->objtotal) {
-		D("Cannot free buf#%d: should be in [2, %d[", i, p->objtotal);
+		nm_prerr("Cannot free buf#%d: should be in [2, %d[", i, p->objtotal);
 		return;
 	}
 	netmap_obj_free(p, i);
@@ -1231,7 +1254,7 @@ netmap_free_bufs(struct netmap_mem_d *nmd, struct netmap_slot *slot, u_int n)
 		if (slot[i].buf_idx > 1)
 			netmap_free_buf(nmd, slot[i].buf_idx);
 	}
-	ND("%s: released some buffers, available: %u",
+	nm_prdis("%s: released some buffers, available: %u",
 			p->name, p->objfree);
 }
 
@@ -1312,25 +1335,25 @@ netmap_config_obj_allocator(struct netmap_obj_pool *p, u_int objtotal, u_int obj
 	p->r_objsize = objsize;
 
 #define MAX_CLUSTSIZE	(1<<22)		// 4 MB
-#define LINE_ROUND	NM_CACHE_ALIGN	// 64
+#define LINE_ROUND	NM_BUF_ALIGN	// 64
 	if (objsize >= MAX_CLUSTSIZE) {
 		/* we could do it but there is no point */
-		D("unsupported allocation for %d bytes", objsize);
+		nm_prerr("unsupported allocation for %d bytes", objsize);
 		return EINVAL;
 	}
 	/* make sure objsize is a multiple of LINE_ROUND */
 	i = (objsize & (LINE_ROUND - 1));
 	if (i) {
-		D("XXX aligning object by %d bytes", LINE_ROUND - i);
+		nm_prinf("aligning object by %d bytes", LINE_ROUND - i);
 		objsize += LINE_ROUND - i;
 	}
 	if (objsize < p->objminsize || objsize > p->objmaxsize) {
-		D("requested objsize %d out of range [%d, %d]",
+		nm_prerr("requested objsize %d out of range [%d, %d]",
 			objsize, p->objminsize, p->objmaxsize);
 		return EINVAL;
 	}
 	if (objtotal < p->nummin || objtotal > p->nummax) {
-		D("requested objtotal %d out of range [%d, %d]",
+		nm_prerr("requested objtotal %d out of range [%d, %d]",
 			objtotal, p->nummin, p->nummax);
 		return EINVAL;
 	}
@@ -1352,13 +1375,13 @@ netmap_config_obj_allocator(struct netmap_obj_pool *p, u_int objtotal, u_int obj
 	}
 	/* exact solution not found */
 	if (clustentries == 0) {
-		D("unsupported allocation for %d bytes", objsize);
+		nm_prerr("unsupported allocation for %d bytes", objsize);
 		return EINVAL;
 	}
 	/* compute clustsize */
 	clustsize = clustentries * objsize;
-	if (netmap_verbose)
-		D("objsize %d clustsize %d objects %d",
+	if (netmap_debug & NM_DEBUG_MEM)
+		nm_prinf("objsize %d clustsize %d objects %d",
 			objsize, clustsize, clustentries);
 
 	/*
@@ -1385,7 +1408,7 @@ netmap_finalize_obj_allocator(struct netmap_obj_pool *p)
 
 	if (p->lut) {
 		/* if the lut is already there we assume that also all the
-		 * clusters have already been allocated, possibily by somebody
+		 * clusters have already been allocated, possibly by somebody
 		 * else (e.g., extmem). In the latter case, the alloc_done flag
 		 * will remain at zero, so that we will not attempt to
 		 * deallocate the clusters by ourselves in
@@ -1401,7 +1424,7 @@ netmap_finalize_obj_allocator(struct netmap_obj_pool *p)
 
 	p->lut = nm_alloc_lut(p->objtotal);
 	if (p->lut == NULL) {
-		D("Unable to create lookup table for '%s'", p->name);
+		nm_prerr("Unable to create lookup table for '%s'", p->name);
 		goto clean;
 	}
 
@@ -1428,7 +1451,7 @@ netmap_finalize_obj_allocator(struct netmap_obj_pool *p)
 			 * If we get here, there is a severe memory shortage,
 			 * so halve the allocated memory to reclaim some.
 			 */
-			D("Unable to create cluster at %d for '%s' allocator",
+			nm_prerr("Unable to create cluster at %d for '%s' allocator",
 			    i, p->name);
 			if (i < 2) /* nothing to halve */
 				goto out;
@@ -1462,9 +1485,9 @@ netmap_finalize_obj_allocator(struct netmap_obj_pool *p)
 #endif
 		}
 	}
-	p->memtotal = p->numclusters * p->_clustsize;
+	p->memtotal = (size_t)p->numclusters * (size_t)p->_clustsize;
 	if (netmap_verbose)
-		D("Pre-allocated %d clusters (%d/%dKB) for '%s'",
+		nm_prinf("Pre-allocated %d clusters (%d/%zuKB) for '%s'",
 		    p->numclusters, p->_clustsize >> 10,
 		    p->memtotal >> 10, p->name);
 
@@ -1496,8 +1519,8 @@ netmap_mem_reset_all(struct netmap_mem_d *nmd)
 {
 	int i;
 
-	if (netmap_verbose)
-		D("resetting %p", nmd);
+	if (netmap_debug & NM_DEBUG_MEM)
+		nm_prinf("resetting %p", nmd);
 	for (i = 0; i < NETMAP_POOLS_NR; i++) {
 		netmap_reset_obj_allocator(&nmd->pools[i]);
 	}
@@ -1508,10 +1531,13 @@ static int
 netmap_mem_unmap(struct netmap_obj_pool *p, struct netmap_adapter *na)
 {
 	int i, lim = p->objtotal;
-	struct netmap_lut *lut = &na->na_lut;
-
+	struct netmap_lut *lut;
 	if (na == NULL || na->pdev == NULL)
 		return 0;
+
+	lut = &na->na_lut;
+
+
 
 #if defined(__FreeBSD__)
 	/* On FreeBSD mapping and unmapping is performed by the txsync
@@ -1523,10 +1549,10 @@ netmap_mem_unmap(struct netmap_obj_pool *p, struct netmap_adapter *na)
 	(void)i;
 	(void)lim;
 	(void)lut;
-	D("unsupported on Windows");
+	nm_prerr("unsupported on Windows");
 #else /* linux */
-	ND("unmapping and freeing plut for %s", na->name);
-	if (lut->plut == NULL)
+	nm_prdis("unmapping and freeing plut for %s", na->name);
+	if (lut->plut == NULL || na->pdev == NULL)
 		return 0;
 	for (i = 0; i < lim; i += p->_clustentries) {
 		if (lut->plut[i].paddr)
@@ -1559,18 +1585,18 @@ netmap_mem_map(struct netmap_obj_pool *p, struct netmap_adapter *na)
 	(void)i;
 	(void)lim;
 	(void)lut;
-	D("unsupported on Windows");
+	nm_prerr("unsupported on Windows");
 #else /* linux */
 
 	if (lut->plut != NULL) {
-		ND("plut already allocated for %s", na->name);
+		nm_prdis("plut already allocated for %s", na->name);
 		return 0;
 	}
 
-	ND("allocating physical lut for %s", na->name);
+	nm_prdis("allocating physical lut for %s", na->name);
 	lut->plut = nm_alloc_plut(lim);
 	if (lut->plut == NULL) {
-		D("Failed to allocate physical lut for %s", na->name);
+		nm_prerr("Failed to allocate physical lut for %s", na->name);
 		return ENOMEM;
 	}
 
@@ -1587,7 +1613,7 @@ netmap_mem_map(struct netmap_obj_pool *p, struct netmap_adapter *na)
 		error = netmap_load_map(na, (bus_dma_tag_t) na->pdev, &lut->plut[i].paddr,
 				p->lut[i].vaddr, p->_clustsize);
 		if (error) {
-			D("Failed to map cluster #%d from the %s pool", i, p->name);
+			nm_prerr("Failed to map cluster #%d from the %s pool", i, p->name);
 			break;
 		}
 
@@ -1618,6 +1644,7 @@ netmap_mem_finalize_all(struct netmap_mem_d *nmd)
 			goto error;
 		nmd->nm_totalsize += nmd->pools[i].memtotal;
 	}
+	nmd->nm_totalsize = (nmd->nm_totalsize + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 	nmd->lasterr = netmap_mem_init_bitmaps(nmd);
 	if (nmd->lasterr)
 		goto error;
@@ -1625,13 +1652,13 @@ netmap_mem_finalize_all(struct netmap_mem_d *nmd)
 	nmd->flags |= NETMAP_MEM_FINALIZED;
 
 	if (netmap_verbose)
-		D("interfaces %d KB, rings %d KB, buffers %d MB",
+		nm_prinf("interfaces %zd KB, rings %zd KB, buffers %zd MB",
 		    nmd->pools[NETMAP_IF_POOL].memtotal >> 10,
 		    nmd->pools[NETMAP_RING_POOL].memtotal >> 10,
 		    nmd->pools[NETMAP_BUF_POOL].memtotal >> 20);
 
 	if (netmap_verbose)
-		D("Free buffers: %d", nmd->pools[NETMAP_BUF_POOL].objfree);
+		nm_prinf("Free buffers: %d", nmd->pools[NETMAP_BUF_POOL].objfree);
 
 
 	return 0;
@@ -1644,11 +1671,17 @@ error:
  * allocator for private memory
  */
 static void *
-_netmap_mem_private_new(size_t size, struct netmap_obj_params *p,
-		struct netmap_mem_ops *ops, int *perr)
+_netmap_mem_private_new(size_t size, struct netmap_obj_params *p, int grp_id,
+		struct netmap_mem_ops *ops, uint64_t memtotal, int *perr)
 {
 	struct netmap_mem_d *d = NULL;
 	int i, err = 0;
+	int checksz = 0;
+
+	/* if memtotal is !=0 we check that the request fits the available
+	 * memory. Moreover, any surprlus memory is assigned to buffers.
+	 */
+	checksz = (memtotal > 0);
 
 	d = nm_os_malloc(size);
 	if (d == NULL) {
@@ -1659,7 +1692,7 @@ _netmap_mem_private_new(size_t size, struct netmap_obj_params *p,
 	*d = nm_blueprint;
 	d->ops = ops;
 
-	err = nm_mem_assign_id(d);
+	err = nm_mem_assign_id(d, grp_id);
 	if (err)
 		goto error_free;
 	snprintf(d->name, NM_MEM_NAMESZ, "%d", d->nm_id);
@@ -1668,22 +1701,45 @@ _netmap_mem_private_new(size_t size, struct netmap_obj_params *p,
 		snprintf(d->pools[i].name, NETMAP_POOL_MAX_NAMSZ,
 				nm_blueprint.pools[i].name,
 				d->name);
+		if (checksz) {
+			uint64_t poolsz = (uint64_t)p[i].num * p[i].size;
+			if (memtotal < poolsz) {
+				nm_prerr("%s: request too large", d->pools[i].name);
+				err = ENOMEM;
+				goto error_rel_id;
+			}
+			memtotal -= poolsz;
+		}
 		d->params[i].num = p[i].num;
 		d->params[i].size = p[i].size;
+	}
+	if (checksz && memtotal > 0) {
+		uint64_t sz = d->params[NETMAP_BUF_POOL].size;
+		uint64_t n = (memtotal + sz - 1) / sz;
+
+		if (n) {
+			if (netmap_verbose) {
+				nm_prinf("%s: adding %llu more buffers",
+				    d->pools[NETMAP_BUF_POOL].name,
+				    (unsigned long long)n);
+			}
+			d->params[NETMAP_BUF_POOL].num += n;
+		}
 	}
 
 	NMA_LOCK_INIT(d);
 
 	err = netmap_mem_config(d);
 	if (err)
-		goto error_rel_id;
+		goto error_destroy_lock;
 
 	d->flags &= ~NETMAP_MEM_FINALIZED;
 
 	return d;
 
-error_rel_id:
+error_destroy_lock:
 	NMA_LOCK_DESTROY(d);
+error_rel_id:
 	nm_mem_release_id(d);
 error_free:
 	nm_os_free(d);
@@ -1738,7 +1794,7 @@ netmap_mem_private_new(u_int txr, u_int txd, u_int rxr, u_int rxd,
 		p[NETMAP_BUF_POOL].num = v;
 
 	if (netmap_verbose)
-		D("req if %d*%d ring %d*%d buf %d*%d",
+		nm_prinf("req if %d*%d ring %d*%d buf %d*%d",
 			p[NETMAP_IF_POOL].num,
 			p[NETMAP_IF_POOL].size,
 			p[NETMAP_RING_POOL].num,
@@ -1746,11 +1802,65 @@ netmap_mem_private_new(u_int txr, u_int txd, u_int rxr, u_int rxd,
 			p[NETMAP_BUF_POOL].num,
 			p[NETMAP_BUF_POOL].size);
 
-	d = _netmap_mem_private_new(sizeof(*d), p, &netmap_mem_global_ops, perr);
+	d = _netmap_mem_private_new(sizeof(*d), p, -1, &netmap_mem_global_ops, 0, perr);
 
 	return d;
 }
 
+/* Reference iommu allocator - find existing or create new,
+ * for not hw addapeters fallback to global allocator.
+ */
+struct netmap_mem_d *
+netmap_mem_get_iommu(struct netmap_adapter *na)
+{
+	int i, err, grp_id;
+	struct netmap_mem_d *nmd;
+
+	if (na == NULL || na->pdev == NULL)
+		return netmap_mem_get(&nm_mem);
+
+	grp_id = nm_iommu_group_id(na->pdev);
+
+	NM_MTX_LOCK(nm_mem_list_lock);
+	nmd = netmap_last_mem_d;
+	do {
+		if (!(nmd->flags & NETMAP_MEM_HIDDEN) && nmd->nm_grp == grp_id) {
+			nmd->refcount++;
+			NM_DBG_REFC(nmd, __FUNCTION__, __LINE__);
+			NM_MTX_UNLOCK(nm_mem_list_lock);
+			return nmd;
+		}
+		nmd = nmd->next;
+	} while (nmd != netmap_last_mem_d);
+
+	nmd = nm_os_malloc(sizeof(*nmd));
+	if (nmd == NULL)
+		goto error;
+
+	*nmd = nm_mem_blueprint;
+
+	err = nm_mem_assign_id_locked(nmd, grp_id);
+	if (err)
+		goto error_free;
+
+	snprintf(nmd->name, sizeof(nmd->name), "%d", nmd->nm_id);
+
+	for (i = 0; i < NETMAP_POOLS_NR; i++) {
+		snprintf(nmd->pools[i].name, NETMAP_POOL_MAX_NAMSZ, "%s-%s",
+			nm_mem_blueprint.pools[i].name, nmd->name);
+	}
+
+	NMA_LOCK_INIT(nmd);
+
+	NM_MTX_UNLOCK(nm_mem_list_lock);
+	return nmd;
+
+error_free:
+	nm_os_free(nmd);
+error:
+	NM_MTX_UNLOCK(nm_mem_list_lock);
+	return NULL;
+}
 
 /* call with lock held */
 static int
@@ -1761,7 +1871,7 @@ netmap_mem2_config(struct netmap_mem_d *nmd)
 	if (!netmap_mem_params_changed(nmd->params))
 		goto out;
 
-	ND("reconfiguring");
+	nm_prdis("reconfiguring");
 
 	if (nmd->flags & NETMAP_MEM_FINALIZED) {
 		/* reset previous allocation */
@@ -1784,7 +1894,7 @@ out:
 }
 
 static int
-netmap_mem2_finalize(struct netmap_mem_d *nmd)
+netmap_mem2_finalize(struct netmap_mem_d *nmd, struct netmap_adapter *na)
 {
 	if (nmd->flags & NETMAP_MEM_FINALIZED)
 		goto out;
@@ -1821,6 +1931,7 @@ NM_MTX_T nm_mem_ext_list_lock;
 int
 netmap_mem_init(void)
 {
+	nm_mem_blueprint = nm_mem;
 	NM_MTX_INIT(nm_mem_list_lock);
 	NMA_LOCK_INIT(&nm_mem);
 	netmap_mem_get(&nm_mem);
@@ -1836,36 +1947,22 @@ netmap_mem_fini(void)
 	netmap_mem_put(&nm_mem);
 }
 
-static void
-netmap_free_rings(struct netmap_adapter *na)
+static int
+netmap_mem_ring_needed(struct netmap_kring *kring)
 {
-	enum txrx t;
-
-	for_rx_tx(t) {
-		u_int i;
-		for (i = 0; i < netmap_all_rings(na, t); i++) {
-			struct netmap_kring *kring = NMR(na, t)[i];
-			struct netmap_ring *ring = kring->ring;
-
-			if (ring == NULL || kring->users > 0 || (kring->nr_kflags & NKR_NEEDRING)) {
-				if (netmap_verbose)
-					D("NOT deleting ring %s (ring %p, users %d neekring %d)",
-						kring->name, ring, kring->users, kring->nr_kflags & NKR_NEEDRING);
-				continue;
-			}
-			if (netmap_verbose)
-				D("deleting ring %s", kring->name);
-			if (!(kring->nr_kflags & NKR_FAKERING)) {
-				ND("freeing bufs for %s", kring->name);
-				netmap_free_bufs(na->nm_mem, ring->slot, kring->nkr_num_slots);
-			} else {
-				ND("NOT freeing bufs for %s", kring->name);
-			}
-			netmap_ring_free(na->nm_mem, ring);
-			kring->ring = NULL;
-		}
-	}
+	return kring->ring == NULL &&
+		(kring->users > 0 ||
+		 (kring->nr_kflags & NKR_NEEDRING));
 }
+
+static int
+netmap_mem_ring_todelete(struct netmap_kring *kring)
+{
+	return kring->ring != NULL &&
+		kring->users == 0 &&
+		!(kring->nr_kflags & NKR_NEEDRING);
+}
+
 
 /* call with NMA_LOCK held *
  *
@@ -1875,7 +1972,7 @@ netmap_free_rings(struct netmap_adapter *na)
  * in netmap_krings_create().
  */
 static int
-netmap_mem2_rings_create(struct netmap_adapter *na)
+netmap_mem2_rings_create(struct netmap_mem_d *nmd, struct netmap_adapter *na)
 {
 	enum txrx t;
 
@@ -1887,51 +1984,53 @@ netmap_mem2_rings_create(struct netmap_adapter *na)
 			struct netmap_ring *ring = kring->ring;
 			u_int len, ndesc;
 
-			if (ring || (!kring->users && !(kring->nr_kflags & NKR_NEEDRING))) {
-				/* uneeded, or already created by somebody else */
-				if (netmap_verbose)
-					D("NOT creating ring %s (ring %p, users %d neekring %d)",
+			if (!netmap_mem_ring_needed(kring)) {
+				/* unneeded, or already created by somebody else */
+				if (netmap_debug & NM_DEBUG_MEM)
+					nm_prinf("NOT creating ring %s (ring %p, users %d neekring %d)",
 						kring->name, ring, kring->users, kring->nr_kflags & NKR_NEEDRING);
 				continue;
 			}
-			if (netmap_verbose)
-				D("creating %s", kring->name);
+			if (netmap_debug & NM_DEBUG_MEM)
+				nm_prinf("creating %s", kring->name);
 			ndesc = kring->nkr_num_slots;
 			len = sizeof(struct netmap_ring) +
 				  ndesc * sizeof(struct netmap_slot);
-			ring = netmap_ring_malloc(na->nm_mem, len);
+			ring = netmap_ring_malloc(nmd, len);
 			if (ring == NULL) {
-				D("Cannot allocate %s_ring", nm_txrx2str(t));
+				nm_prerr("Cannot allocate %s_ring", nm_txrx2str(t));
 				goto cleanup;
 			}
-			ND("txring at %p", ring);
+			nm_prdis("txring at %p", ring);
 			kring->ring = ring;
 			*(uint32_t *)(uintptr_t)&ring->num_slots = ndesc;
 			*(int64_t *)(uintptr_t)&ring->buf_ofs =
-			    (na->nm_mem->pools[NETMAP_IF_POOL].memtotal +
-				na->nm_mem->pools[NETMAP_RING_POOL].memtotal) -
-				netmap_ring_offset(na->nm_mem, ring);
+			    (nmd->pools[NETMAP_IF_POOL].memtotal +
+				nmd->pools[NETMAP_RING_POOL].memtotal) -
+				netmap_ring_offset(nmd, ring);
 
 			/* copy values from kring */
 			ring->head = kring->rhead;
 			ring->cur = kring->rcur;
 			ring->tail = kring->rtail;
 			*(uint32_t *)(uintptr_t)&ring->nr_buf_size =
-				netmap_mem_bufsize(na->nm_mem);
-			ND("%s h %d c %d t %d", kring->name,
+				netmap_mem_bufsize(nmd);
+			nm_prdis("%s h %d c %d t %d", kring->name,
 				ring->head, ring->cur, ring->tail);
-			ND("initializing slots for %s_ring", nm_txrx2str(txrx));
+			nm_prdis("initializing slots for %s_ring", nm_txrx2str(t));
 			if (!(kring->nr_kflags & NKR_FAKERING)) {
 				/* this is a real ring */
-				ND("allocating buffers for %s", kring->name);
-				if (netmap_new_bufs(na->nm_mem, ring->slot, ndesc)) {
-					D("Cannot allocate buffers for %s_ring", nm_txrx2str(t));
+				if (netmap_debug & NM_DEBUG_MEM)
+					nm_prinf("allocating buffers for %s", kring->name);
+				if (netmap_new_bufs(nmd, ring->slot, ndesc)) {
+					nm_prerr("Cannot allocate buffers for %s_ring", nm_txrx2str(t));
 					goto cleanup;
 				}
 			} else {
 				/* this is a fake ring, set all indices to 0 */
-				ND("NOT allocating buffers for %s", kring->name);
-				netmap_mem_set_ring(na->nm_mem, ring->slot, ndesc, 0);
+				if (netmap_debug & NM_DEBUG_MEM)
+					nm_prinf("NOT allocating buffers for %s", kring->name);
+				netmap_mem_set_ring(nmd, ring->slot, ndesc, 0);
 			}
 		        /* ring info */
 		        *(uint16_t *)(uintptr_t)&ring->ringid = kring->ring_id;
@@ -1952,12 +2051,35 @@ cleanup:
 }
 
 static void
-netmap_mem2_rings_delete(struct netmap_adapter *na)
+netmap_mem2_rings_delete(struct netmap_mem_d *nmd, struct netmap_adapter *na)
 {
-	/* last instance, release bufs and rings */
-	netmap_free_rings(na);
-}
+	enum txrx t;
 
+	for_rx_tx(t) {
+		u_int i;
+		for (i = 0; i < netmap_all_rings(na, t); i++) {
+			struct netmap_kring *kring = NMR(na, t)[i];
+			struct netmap_ring *ring = kring->ring;
+
+			if (!netmap_mem_ring_todelete(kring)) {
+				if (netmap_debug & NM_DEBUG_MEM)
+					nm_prinf("NOT deleting ring %s (ring %p, users %d neekring %d)",
+						kring->name, ring, kring->users, kring->nr_kflags & NKR_NEEDRING);
+				continue;
+			}
+			if (netmap_debug & NM_DEBUG_MEM)
+				nm_prinf("deleting ring %s", kring->name);
+			if (!(kring->nr_kflags & NKR_FAKERING)) {
+				nm_prdis("freeing bufs for %s", kring->name);
+				netmap_free_bufs(nmd, ring->slot, kring->nkr_num_slots);
+			} else {
+				nm_prdis("NOT freeing bufs for %s", kring->name);
+			}
+			netmap_ring_free(nmd, ring);
+			kring->ring = NULL;
+		}
+	}
+}
 
 /* call with NMA_LOCK held */
 /*
@@ -1968,7 +2090,8 @@ netmap_mem2_rings_delete(struct netmap_adapter *na)
  * the interface is in netmap mode.
  */
 static struct netmap_if *
-netmap_mem2_if_new(struct netmap_adapter *na, struct netmap_priv_d *priv)
+netmap_mem2_if_new(struct netmap_mem_d *nmd,
+		struct netmap_adapter *na, struct netmap_priv_d *priv)
 {
 	struct netmap_if *nifp;
 	ssize_t base; /* handy for relative offsets between rings and nifp */
@@ -1987,23 +2110,26 @@ netmap_mem2_if_new(struct netmap_adapter *na, struct netmap_priv_d *priv)
 	 */
 
 	len = sizeof(struct netmap_if) + (ntot * sizeof(ssize_t));
-	nifp = netmap_if_malloc(na->nm_mem, len);
+	nifp = netmap_if_malloc(nmd, len);
 	if (nifp == NULL) {
-		NMA_UNLOCK(na->nm_mem);
 		return NULL;
 	}
 
 	/* initialize base fields -- override const */
 	*(u_int *)(uintptr_t)&nifp->ni_tx_rings = na->num_tx_rings;
 	*(u_int *)(uintptr_t)&nifp->ni_rx_rings = na->num_rx_rings;
-	strncpy(nifp->ni_name, na->name, (size_t)IFNAMSIZ);
+	*(u_int *)(uintptr_t)&nifp->ni_host_tx_rings =
+		(na->num_host_tx_rings ? na->num_host_tx_rings : 1);
+	*(u_int *)(uintptr_t)&nifp->ni_host_rx_rings =
+		(na->num_host_rx_rings ? na->num_host_rx_rings : 1);
+	strlcpy(nifp->ni_name, na->name, sizeof(nifp->ni_name));
 
 	/*
 	 * fill the slots for the rx and tx rings. They contain the offset
 	 * between the ring and nifp, so the information is usable in
 	 * userspace to reach the ring from the nifp.
 	 */
-	base = netmap_if_offset(na->nm_mem, nifp);
+	base = netmap_if_offset(nmd, nifp);
 	for (i = 0; i < n[NR_TX]; i++) {
 		/* XXX instead of ofs == 0 maybe use the offset of an error
 		 * ring, like we do for buffers? */
@@ -2011,7 +2137,7 @@ netmap_mem2_if_new(struct netmap_adapter *na, struct netmap_priv_d *priv)
 
 		if (na->tx_rings[i]->ring != NULL && i >= priv->np_qfirst[NR_TX]
 				&& i < priv->np_qlast[NR_TX]) {
-			ofs = netmap_ring_offset(na->nm_mem,
+			ofs = netmap_ring_offset(nmd,
 						 na->tx_rings[i]->ring) - base;
 		}
 		*(ssize_t *)(uintptr_t)&nifp->ring_ofs[i] = ofs;
@@ -2023,7 +2149,7 @@ netmap_mem2_if_new(struct netmap_adapter *na, struct netmap_priv_d *priv)
 
 		if (na->rx_rings[i]->ring != NULL && i >= priv->np_qfirst[NR_RX]
 				&& i < priv->np_qlast[NR_RX]) {
-			ofs = netmap_ring_offset(na->nm_mem,
+			ofs = netmap_ring_offset(nmd,
 						 na->rx_rings[i]->ring) - base;
 		}
 		*(ssize_t *)(uintptr_t)&nifp->ring_ofs[i+n[NR_TX]] = ofs;
@@ -2033,22 +2159,23 @@ netmap_mem2_if_new(struct netmap_adapter *na, struct netmap_priv_d *priv)
 }
 
 static void
-netmap_mem2_if_delete(struct netmap_adapter *na, struct netmap_if *nifp)
+netmap_mem2_if_delete(struct netmap_mem_d *nmd,
+		struct netmap_adapter *na, struct netmap_if *nifp)
 {
 	if (nifp == NULL)
 		/* nothing to do */
 		return;
 	if (nifp->ni_bufs_head)
 		netmap_extra_free(na, nifp->ni_bufs_head);
-	netmap_if_free(na->nm_mem, nifp);
+	netmap_if_free(nmd, nifp);
 }
 
 static void
-netmap_mem2_deref(struct netmap_mem_d *nmd)
+netmap_mem2_deref(struct netmap_mem_d *nmd, struct netmap_adapter *na)
 {
 
-	if (netmap_verbose)
-		D("active = %d", nmd->active);
+	if (netmap_debug & NM_DEBUG_MEM)
+		nm_prinf("active = %d", nmd->active);
 
 }
 
@@ -2215,14 +2342,15 @@ netmap_mem_ext_create(uint64_t usrptr, struct nmreq_pools_info *pi, int *perror)
 		pi->nr_buf_pool_objtotal = netmap_min_priv_params[NETMAP_BUF_POOL].num;
 	if (pi->nr_buf_pool_objsize == 0)
 		pi->nr_buf_pool_objsize = netmap_min_priv_params[NETMAP_BUF_POOL].size;
-	D("if %d %d ring %d %d buf %d %d",
+	if (netmap_verbose & NM_DEBUG_MEM)
+		nm_prinf("if %d %d ring %d %d buf %d %d",
 			pi->nr_if_pool_objtotal, pi->nr_if_pool_objsize,
 			pi->nr_ring_pool_objtotal, pi->nr_ring_pool_objsize,
 			pi->nr_buf_pool_objtotal, pi->nr_buf_pool_objsize);
 
 	os = nm_os_extmem_create(usrptr, pi, &error);
 	if (os == NULL) {
-		D("os extmem creation failed");
+		nm_prerr("os extmem creation failed");
 		goto out;
 	}
 
@@ -2231,14 +2359,18 @@ netmap_mem_ext_create(uint64_t usrptr, struct nmreq_pools_info *pi, int *perror)
 		nm_os_extmem_delete(os);
 		return &nme->up;
 	}
-	D("not found, creating new");
+	if (netmap_verbose & NM_DEBUG_MEM)
+		nm_prinf("not found, creating new");
 
 	nme = _netmap_mem_private_new(sizeof(*nme),
+
 			(struct netmap_obj_params[]){
 				{ pi->nr_if_pool_objsize, pi->nr_if_pool_objtotal },
 				{ pi->nr_ring_pool_objsize, pi->nr_ring_pool_objtotal },
 				{ pi->nr_buf_pool_objsize, pi->nr_buf_pool_objtotal }},
+			-1,
 			&netmap_mem_ext_ops,
+			pi->nr_memsize,
 			&error);
 	if (nme == NULL)
 		goto out_unmap;
@@ -2252,10 +2384,11 @@ netmap_mem_ext_create(uint64_t usrptr, struct nmreq_pools_info *pi, int *perror)
 	os = NULL; /* pass ownership */
 
 	clust = nm_os_extmem_nextpage(nme->os);
-	off = 0;
 	for (i = 0; i < NETMAP_POOLS_NR; i++) {
 		struct netmap_obj_pool *p = &nme->up.pools[i];
 		struct netmap_obj_params *o = &nme->up.params[i];
+
+		off = 0;
 
 		p->_objsize = o->size;
 		p->_clustsize = o->size;
@@ -2288,19 +2421,19 @@ netmap_mem_ext_create(uint64_t usrptr, struct nmreq_pools_info *pi, int *perror)
 #if !defined(linux) && !defined(_WIN32)
 			p->lut[j].paddr = vtophys(p->lut[j].vaddr);
 #endif
-			ND("%s %d at %p", p->name, j, p->lut[j].vaddr);
+			nm_prdis("%s %d at %p", p->name, j, p->lut[j].vaddr);
 			noff = off + p->_objsize;
 			if (noff < PAGE_SIZE) {
 				off = noff;
 				continue;
 			}
-			ND("too big, recomputing offset...");
+			nm_prdis("too big, recomputing offset...");
 			while (noff >= PAGE_SIZE) {
 				char *old_clust = clust;
 				noff -= PAGE_SIZE;
 				clust = nm_os_extmem_nextpage(nme->os);
 				nr_pages--;
-				ND("noff %zu page %p nr_pages %d", noff,
+				nm_prdis("noff %zu page %p nr_pages %d", noff,
 						page_to_virt(*pages), nr_pages);
 				if (noff > 0 && !nm_isset(p->invalid_bitmap, j) &&
 					(nr_pages == 0 ||
@@ -2310,7 +2443,7 @@ netmap_mem_ext_create(uint64_t usrptr, struct nmreq_pools_info *pi, int *perror)
 					 * drop this object
 					 * */
 					p->invalid_bitmap[ (j>>5) ] |= 1U << (j & 31U);
-					ND("non contiguous at off %zu, drop", noff);
+					nm_prdis("non contiguous at off %zu, drop", noff);
 				}
 				if (nr_pages == 0)
 					break;
@@ -2319,8 +2452,16 @@ netmap_mem_ext_create(uint64_t usrptr, struct nmreq_pools_info *pi, int *perror)
 		}
 		p->objtotal = j;
 		p->numclusters = p->objtotal;
-		p->memtotal = j * p->_objsize;
-		ND("%d memtotal %u", j, p->memtotal);
+		p->memtotal = j * (size_t)p->_objsize;
+		if (p->memtotal & (PAGE_SIZE - 1)) {
+			// make sure that the objects of the next pool start page-aligned
+			p->memtotal = (p->memtotal & ~(PAGE_SIZE - 1)) + PAGE_SIZE;
+			if (nr_pages > 0) {
+				clust = nm_os_extmem_nextpage(nme->os);
+				nr_pages--;
+			}
+		}
+		nm_prdis("%d memtotal %zu", j, p->memtotal);
 	}
 
 	netmap_mem_ext_register(nme);
@@ -2341,10 +2482,10 @@ out:
 #endif /* WITH_EXTMEM */
 
 
-#ifdef WITH_PTNETMAP_GUEST
+#ifdef WITH_PTNETMAP
 struct mem_pt_if {
 	struct mem_pt_if *next;
-	struct ifnet *ifp;
+	if_t ifp;
 	unsigned int nifp_offset;
 };
 
@@ -2362,7 +2503,7 @@ struct netmap_mem_ptg {
 
 /* Link a passthrough interface to a passthrough netmap allocator. */
 static int
-netmap_mem_pt_guest_ifp_add(struct netmap_mem_d *nmd, struct ifnet *ifp,
+netmap_mem_pt_guest_ifp_add(struct netmap_mem_d *nmd, if_t ifp,
 			    unsigned int nifp_offset)
 {
 	struct netmap_mem_ptg *ptnmd = (struct netmap_mem_ptg *)nmd;
@@ -2384,14 +2525,15 @@ netmap_mem_pt_guest_ifp_add(struct netmap_mem_d *nmd, struct ifnet *ifp,
 
 	NMA_UNLOCK(nmd);
 
-	D("added (ifp=%p,nifp_offset=%u)", ptif->ifp, ptif->nifp_offset);
+	nm_prinf("ifp=%s,nifp_offset=%u",
+		if_name(ptif->ifp), ptif->nifp_offset);
 
 	return 0;
 }
 
 /* Called with NMA_LOCK(nmd) held. */
 static struct mem_pt_if *
-netmap_mem_pt_guest_ifp_lookup(struct netmap_mem_d *nmd, struct ifnet *ifp)
+netmap_mem_pt_guest_ifp_lookup(struct netmap_mem_d *nmd, if_t ifp)
 {
 	struct netmap_mem_ptg *ptnmd = (struct netmap_mem_ptg *)nmd;
 	struct mem_pt_if *curr;
@@ -2407,7 +2549,7 @@ netmap_mem_pt_guest_ifp_lookup(struct netmap_mem_d *nmd, struct ifnet *ifp)
 
 /* Unlink a passthrough interface from a passthrough netmap allocator. */
 int
-netmap_mem_pt_guest_ifp_del(struct netmap_mem_d *nmd, struct ifnet *ifp)
+netmap_mem_pt_guest_ifp_del(struct netmap_mem_d *nmd, if_t ifp)
 {
 	struct netmap_mem_ptg *ptnmd = (struct netmap_mem_ptg *)nmd;
 	struct mem_pt_if *prev = NULL;
@@ -2423,8 +2565,8 @@ netmap_mem_pt_guest_ifp_del(struct netmap_mem_d *nmd, struct ifnet *ifp)
 			} else {
 				ptnmd->pt_ifs = curr->next;
 			}
-			D("removed (ifp=%p,nifp_offset=%u)",
-			  curr->ifp, curr->nifp_offset);
+			nm_prinf("removed (ifp=%s,nifp_offset=%u)",
+			  if_name(curr->ifp), curr->nifp_offset);
 			nm_os_free(curr);
 			ret = 0;
 			break;
@@ -2479,7 +2621,7 @@ netmap_mem_pt_guest_ofstophys(struct netmap_mem_d *nmd, vm_ooffset_t off)
 	vm_paddr_t paddr;
 	/* if the offset is valid, just return csb->base_addr + off */
 	paddr = (vm_paddr_t)(ptnmd->nm_paddr + off);
-	ND("off %lx padr %lx", off, (unsigned long)paddr);
+	nm_prdis("off %lx padr %lx", off, (unsigned long)paddr);
 	return paddr;
 }
 
@@ -2493,7 +2635,7 @@ netmap_mem_pt_guest_config(struct netmap_mem_d *nmd)
 }
 
 static int
-netmap_mem_pt_guest_finalize(struct netmap_mem_d *nmd)
+netmap_mem_pt_guest_finalize(struct netmap_mem_d *nmd, struct netmap_adapter *na)
 {
 	struct netmap_mem_ptg *ptnmd = (struct netmap_mem_ptg *)nmd;
 	uint64_t mem_size;
@@ -2509,7 +2651,7 @@ netmap_mem_pt_guest_finalize(struct netmap_mem_d *nmd)
 		goto out;
 
 	if (ptnmd->ptn_dev == NULL) {
-		D("ptnetmap memdev not attached");
+		nm_prerr("ptnetmap memdev not attached");
 		error = ENOMEM;
 		goto out;
 	}
@@ -2528,10 +2670,10 @@ netmap_mem_pt_guest_finalize(struct netmap_mem_d *nmd)
 
 	/* allocate the lut */
 	if (ptnmd->buf_lut.lut == NULL) {
-		D("allocating lut");
+		nm_prinf("allocating lut");
 		ptnmd->buf_lut.lut = nm_alloc_lut(nbuffers);
 		if (ptnmd->buf_lut.lut == NULL) {
-			D("lut allocation failed");
+			nm_prerr("lut allocation failed");
 			return ENOMEM;
 		}
 	}
@@ -2550,7 +2692,7 @@ netmap_mem_pt_guest_finalize(struct netmap_mem_d *nmd)
 
 	ptnmd->buf_lut.objtotal = nbuffers;
 	ptnmd->buf_lut.objsize = bufsize;
-	nmd->nm_totalsize = (unsigned int)mem_size;
+	nmd->nm_totalsize = mem_size;
 
 	/* Initialize these fields as are needed by
 	 * netmap_mem_bufsize().
@@ -2566,7 +2708,7 @@ out:
 }
 
 static void
-netmap_mem_pt_guest_deref(struct netmap_mem_d *nmd)
+netmap_mem_pt_guest_deref(struct netmap_mem_d *nmd, struct netmap_adapter *na)
 {
 	struct netmap_mem_ptg *ptnmd = (struct netmap_mem_ptg *)nmd;
 
@@ -2596,25 +2738,26 @@ netmap_mem_pt_guest_delete(struct netmap_mem_d *nmd)
 	if (nmd == NULL)
 		return;
 	if (netmap_verbose)
-		D("deleting %p", nmd);
+		nm_prinf("deleting %p", nmd);
 	if (nmd->active > 0)
-		D("bug: deleting mem allocator with active=%d!", nmd->active);
+		nm_prerr("bug: deleting mem allocator with active=%d!", nmd->active);
 	if (netmap_verbose)
-		D("done deleting %p", nmd);
+		nm_prinf("done deleting %p", nmd);
 	NMA_LOCK_DESTROY(nmd);
 	nm_os_free(nmd);
 }
 
 static struct netmap_if *
-netmap_mem_pt_guest_if_new(struct netmap_adapter *na, struct netmap_priv_d *priv)
+netmap_mem_pt_guest_if_new(struct netmap_mem_d *nmd,
+		struct netmap_adapter *na, struct netmap_priv_d *priv)
 {
-	struct netmap_mem_ptg *ptnmd = (struct netmap_mem_ptg *)na->nm_mem;
+	struct netmap_mem_ptg *ptnmd = (struct netmap_mem_ptg *)nmd;
 	struct mem_pt_if *ptif;
 	struct netmap_if *nifp = NULL;
 
-	ptif = netmap_mem_pt_guest_ifp_lookup(na->nm_mem, na->ifp);
+	ptif = netmap_mem_pt_guest_ifp_lookup(nmd, na->ifp);
 	if (ptif == NULL) {
-		D("Error: interface %p is not in passthrough", na->ifp);
+		nm_prerr("interface %s is not in passthrough", na->name);
 		goto out;
 	}
 
@@ -2625,27 +2768,29 @@ out:
 }
 
 static void
-netmap_mem_pt_guest_if_delete(struct netmap_adapter *na, struct netmap_if *nifp)
+netmap_mem_pt_guest_if_delete(struct netmap_mem_d * nmd,
+		struct netmap_adapter *na, struct netmap_if *nifp)
 {
 	struct mem_pt_if *ptif;
 
-	ptif = netmap_mem_pt_guest_ifp_lookup(na->nm_mem, na->ifp);
+	ptif = netmap_mem_pt_guest_ifp_lookup(nmd, na->ifp);
 	if (ptif == NULL) {
-		D("Error: interface %p is not in passthrough", na->ifp);
+		nm_prerr("interface %s is not in passthrough", na->name);
 	}
 }
 
 static int
-netmap_mem_pt_guest_rings_create(struct netmap_adapter *na)
+netmap_mem_pt_guest_rings_create(struct netmap_mem_d *nmd,
+		struct netmap_adapter *na)
 {
-	struct netmap_mem_ptg *ptnmd = (struct netmap_mem_ptg *)na->nm_mem;
+	struct netmap_mem_ptg *ptnmd = (struct netmap_mem_ptg *)nmd;
 	struct mem_pt_if *ptif;
 	struct netmap_if *nifp;
 	int i, error = -1;
 
-	ptif = netmap_mem_pt_guest_ifp_lookup(na->nm_mem, na->ifp);
+	ptif = netmap_mem_pt_guest_ifp_lookup(nmd, na->ifp);
 	if (ptif == NULL) {
-		D("Error: interface %p is not in passthrough", na->ifp);
+		nm_prerr("interface %s is not in passthrough", na->name);
 		goto out;
 	}
 
@@ -2665,7 +2810,7 @@ netmap_mem_pt_guest_rings_create(struct netmap_adapter *na)
 			continue;
 		kring->ring = (struct netmap_ring *)
 			((char *)nifp +
-			 nifp->ring_ofs[i + na->num_tx_rings + 1]);
+			 nifp->ring_ofs[netmap_all_rings(na, NR_TX) + i]);
 	}
 
 	error = 0;
@@ -2674,7 +2819,7 @@ out:
 }
 
 static void
-netmap_mem_pt_guest_rings_delete(struct netmap_adapter *na)
+netmap_mem_pt_guest_rings_delete(struct netmap_mem_d *nmd, struct netmap_adapter *na)
 {
 #if 0
 	enum txrx t;
@@ -2688,6 +2833,8 @@ netmap_mem_pt_guest_rings_delete(struct netmap_adapter *na)
 		}
 	}
 #endif
+	(void)nmd;
+	(void)na;
 }
 
 static struct netmap_mem_ops netmap_mem_pt_guest_ops = {
@@ -2745,7 +2892,7 @@ netmap_mem_pt_guest_create(nm_memid_t mem_id)
 	ptnmd->pt_ifs = NULL;
 
 	/* Assign new id in the guest (We have the lock) */
-	err = nm_mem_assign_id_locked(&ptnmd->up);
+	err = nm_mem_assign_id_locked(&ptnmd->up, -1);
 	if (err)
 		goto error;
 
@@ -2811,7 +2958,7 @@ netmap_mem_pt_guest_attach(struct ptnetmap_memdev *ptn_dev, nm_memid_t mem_id)
 
 /* Called when ptnet device is attaching */
 struct netmap_mem_d *
-netmap_mem_pt_guest_new(struct ifnet *ifp,
+netmap_mem_pt_guest_new(if_t ifp,
 			unsigned int nifp_offset,
 			unsigned int memid)
 {
@@ -2830,4 +2977,4 @@ netmap_mem_pt_guest_new(struct ifnet *ifp,
 	return nmd;
 }
 
-#endif /* WITH_PTNETMAP_GUEST */
+#endif /* WITH_PTNETMAP */

@@ -1,4 +1,6 @@
-/*
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
+ *
  * Copyright (C) 2012-2014 Matteo Landi
  * Copyright (C) 2012-2016 Luigi Rizzo
  * Copyright (C) 2012-2016 Giuseppe Lettieri
@@ -27,7 +29,7 @@
  */
 
 /*
- * $FreeBSD: head/sys/dev/netmap/netmap_mem2.c 234290 2012-04-14 16:44:18Z luigi $
+ * $FreeBSD$
  *
  * (New) memory allocator for netmap
  */
@@ -55,7 +57,7 @@
  * of the object, and from there locate the offset from the beginning
  * of the region.
  *
- * The invididual allocators manage a pool of memory for objects of
+ * The individual allocators manage a pool of memory for objects of
  * the same size.
  * The pool is split into smaller clusters, whose size is a
  * multiple of the page size. The cluster size is chosen
@@ -68,7 +70,7 @@
  * Allocation scans the bitmap; this is done only on attach, so we are not
  * too worried about performance
  *
- * For each allocator we can define (thorugh sysctl) the size and
+ * For each allocator we can define (through sysctl) the size and
  * number of each object. Memory is allocated at the first use of a
  * netmap file descriptor, and can be freed when all such descriptors
  * have been released (including unmapping the memory).
@@ -145,6 +147,7 @@ struct netmap_mem_d* netmap_mem_private_new( u_int txr, u_int txd, u_int rxr, u_
 #define netmap_mem_get(d) __netmap_mem_get(d, __FUNCTION__, __LINE__)
 #define netmap_mem_put(d) __netmap_mem_put(d, __FUNCTION__, __LINE__)
 struct netmap_mem_d* __netmap_mem_get(struct netmap_mem_d *, const char *, int);
+struct netmap_mem_d* netmap_mem_get_iommu(struct netmap_adapter *);
 void __netmap_mem_put(struct netmap_mem_d *, const char *, int);
 struct netmap_mem_d* netmap_mem_find(nm_memid_t);
 unsigned netmap_mem_bufsize(struct netmap_mem_d *nmd);
@@ -156,21 +159,20 @@ struct netmap_mem_d* netmap_mem_ext_create(uint64_t, struct nmreq_pools_info *, 
 	({ int *perr = _perr; if (perr) *(perr) = EOPNOTSUPP; NULL; })
 #endif /* WITH_EXTMEM */
 
-#ifdef WITH_PTNETMAP_GUEST
-struct netmap_mem_d* netmap_mem_pt_guest_new(struct ifnet *,
+#ifdef WITH_PTNETMAP
+struct netmap_mem_d* netmap_mem_pt_guest_new(if_t,
 					     unsigned int nifp_offset,
 					     unsigned int memid);
 struct ptnetmap_memdev;
 struct netmap_mem_d* netmap_mem_pt_guest_attach(struct ptnetmap_memdev *, uint16_t);
-int netmap_mem_pt_guest_ifp_del(struct netmap_mem_d *, struct ifnet *);
-#endif /* WITH_PTNETMAP_GUEST */
+int netmap_mem_pt_guest_ifp_del(struct netmap_mem_d *, if_t);
+#endif /* WITH_PTNETMAP */
 
 int netmap_mem_pools_info_get(struct nmreq_pools_info *,
 				struct netmap_mem_d *);
 
 #define NETMAP_MEM_PRIVATE	0x2	/* allocator uses private address space */
 #define NETMAP_MEM_IO		0x4	/* the underlying memory is mmapped I/O */
-#define NETMAP_MEM_EXT		0x10	/* external memory (not remappable) */
 
 uint32_t netmap_extra_alloc(struct netmap_adapter *, uint32_t *, uint32_t n);
 

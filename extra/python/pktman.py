@@ -167,7 +167,7 @@ if __name__ == '__main__':
                     choices = ['tx', 'rx'], default = 'rx')
     parser.add_argument('-b', '--batchsize', help = 'number of packets to send with each TXSYNC '
                     'operation', type=int, default = 512, dest = 'batch')
-    parser.add_argument('-l', '--length', help = 'lenght of the ethernet frame sent',
+    parser.add_argument('-l', '--length', help = 'length of the ethernet frame sent',
                     type = int, default = 60)
     parser.add_argument('-D', '--dstmac', help = 'destination MAC of tx packets',
                     default = 'ff:ff:ff:ff:ff:ff')
@@ -235,7 +235,7 @@ if __name__ == '__main__':
         job = multiprocessing.Process(name = 'worker-' + str(i),
                                         target = handler[args.function],
                                         args = (ring_id, ifname, args, parser, queue))
-        job.deamon = True   # ensure work termination
+        job.daemon = True   # ensure work termination
         jobs.append(job)
 
     # start all the workers

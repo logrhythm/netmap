@@ -1,4 +1,6 @@
-/*
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
+ *
  * Copyright (C) 2018 Vincenzo Maffione
  * All rights reserved.
  *
@@ -23,6 +25,8 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
+
+/* $FreeBSD$ */
 
 #if defined(__FreeBSD__)
 #include <sys/cdefs.h> /* prerequisite */
@@ -52,6 +56,7 @@
  */
 #include <net/netmap.h>
 #include <dev/netmap/netmap_kern.h>
+#include <dev/netmap/netmap_bdg.h>
 
 static int
 nmreq_register_from_legacy(struct nmreq *nmr, struct nmreq_header *hdr,
@@ -63,23 +68,26 @@ nmreq_register_from_legacy(struct nmreq *nmr, struct nmreq_header *hdr,
 	req->nr_rx_slots = nmr->nr_rx_slots;
 	req->nr_tx_rings = nmr->nr_tx_rings;
 	req->nr_rx_rings = nmr->nr_rx_rings;
+	req->nr_host_tx_rings = 0;
+	req->nr_host_rx_rings = 0;
 	req->nr_mem_id = nmr->nr_arg2;
 	req->nr_ringid = nmr->nr_ringid & NETMAP_RING_MASK;
 	if ((nmr->nr_flags & NR_REG_MASK) == NR_REG_DEFAULT) {
 		/* Convert the older nmr->nr_ringid (original
 		 * netmap control API) to nmr->nr_flags. */
 		u_int regmode = NR_REG_DEFAULT;
-		if (req->nr_ringid & NETMAP_SW_RING) {
+		if (nmr->nr_ringid & NETMAP_SW_RING) {
 			regmode = NR_REG_SW;
-		} else if (req->nr_ringid & NETMAP_HW_RING) {
+		} else if (nmr->nr_ringid & NETMAP_HW_RING) {
 			regmode = NR_REG_ONE_NIC;
 		} else {
 			regmode = NR_REG_ALL_NIC;
 		}
-		nmr->nr_flags = regmode |
-			(nmr->nr_flags & (~NR_REG_MASK));
+		req->nr_mode = regmode;
+	} else {
+		req->nr_mode = nmr->nr_flags & NR_REG_MASK;
 	}
-	req->nr_mode = nmr->nr_flags & NR_REG_MASK;
+
 	/* Fix nr_name, nr_mode and nr_ringid to handle pipe requests. */
 	if (req->nr_mode == NR_REG_PIPE_MASTER ||
 			req->nr_mode == NR_REG_PIPE_SLAVE) {
@@ -92,7 +100,7 @@ nmreq_register_from_legacy(struct nmreq *nmr, struct nmreq_header *hdr,
 			/* No space for the pipe suffix. */
 			return ENOBUFS;
 		}
-		strncat(hdr->nr_name, suffix, strlen(suffix));
+		strlcat(hdr->nr_name, suffix, sizeof(hdr->nr_name));
 		req->nr_mode = NR_REG_ALL_NIC;
 		req->nr_ringid = 0;
 	}
@@ -127,7 +135,7 @@ nmreq_from_legacy(struct nmreq *nmr, u_long ioctl_cmd)
 
 	/* First prepare the request header. */
 	hdr->nr_version = NETMAP_API; /* new API */
-	strncpy(hdr->nr_name, nmr->nr_name, sizeof(nmr->nr_name));
+	strlcpy(hdr->nr_name, nmr->nr_name, sizeof(nmr->nr_name));
 	hdr->nr_options = (uintptr_t)NULL;
 	hdr->nr_body = (uintptr_t)NULL;
 
@@ -217,7 +225,7 @@ nmreq_from_legacy(struct nmreq *nmr, u_long ioctl_cmd)
 		}
 		case NETMAP_PT_HOST_CREATE:
 		case NETMAP_PT_HOST_DELETE: {
-			D("Netmap passthrough not supported yet");
+			nm_prerr("Netmap passthrough not supported yet");
 			return NULL;
 			break;
 		}
@@ -238,12 +246,13 @@ nmreq_from_legacy(struct nmreq *nmr, u_long ioctl_cmd)
 			if (!req) { goto oom; }
 			hdr->nr_body = (uintptr_t)req;
 			hdr->nr_reqtype = NETMAP_REQ_PORT_INFO_GET;
-			req->nr_offset = nmr->nr_offset;
 			req->nr_memsize = nmr->nr_memsize;
 			req->nr_tx_slots = nmr->nr_tx_slots;
 			req->nr_rx_slots = nmr->nr_rx_slots;
 			req->nr_tx_rings = nmr->nr_tx_rings;
 			req->nr_rx_rings = nmr->nr_rx_rings;
+			req->nr_host_tx_rings = 0;
+			req->nr_host_rx_rings = 0;
 			req->nr_mem_id = nmr->nr_arg2;
 		}
 		break;
@@ -258,7 +267,7 @@ oom:
 		}
 		nm_os_free(hdr);
 	}
-	D("Failed to allocate memory for nmreq_xyz struct");
+	nm_prerr("Failed to allocate memory for nmreq_xyz struct");
 
 	return NULL;
 }
@@ -296,7 +305,6 @@ nmreq_to_legacy(struct nmreq_header *hdr, struct nmreq *nmr)
 	case NETMAP_REQ_PORT_INFO_GET: {
 		struct nmreq_port_info_get *req =
 			(struct nmreq_port_info_get *)(uintptr_t)hdr->nr_body;
-		nmr->nr_offset = req->nr_offset;
 		nmr->nr_memsize = req->nr_memsize;
 		nmr->nr_tx_slots = req->nr_tx_slots;
 		nmr->nr_rx_slots = req->nr_rx_slots;
@@ -317,7 +325,7 @@ nmreq_to_legacy(struct nmreq_header *hdr, struct nmreq *nmr)
 	case NETMAP_REQ_VALE_LIST: {
 		struct nmreq_vale_list *req =
 			(struct nmreq_vale_list *)(uintptr_t)hdr->nr_body;
-		strncpy(nmr->nr_name, hdr->nr_name, sizeof(nmr->nr_name));
+		strlcpy(nmr->nr_name, hdr->nr_name, sizeof(nmr->nr_name));
 		nmr->nr_arg1 = req->nr_bridge_idx;
 		nmr->nr_arg2 = req->nr_port_idx;
 		break;
@@ -361,7 +369,14 @@ netmap_ioctl_legacy(struct netmap_priv_d *priv, u_long cmd, caddr_t data,
 		/* Request for the legacy control API. Convert it to a
 		 * NIOCCTRL request. */
 		struct nmreq *nmr = (struct nmreq *) data;
-		struct nmreq_header *hdr = nmreq_from_legacy(nmr, cmd);
+		struct nmreq_header *hdr;
+
+		if (nmr->nr_version < 14) {
+			nm_prerr("Minimum supported API is 14 (requested %u)",
+			    nmr->nr_version);
+			return EINVAL;
+		}
+		hdr = nmreq_from_legacy(nmr, cmd);
 		if (hdr == NULL) { /* out of memory */
 			return ENOMEM;
 		}
@@ -386,27 +401,27 @@ netmap_ioctl_legacy(struct netmap_priv_d *priv, u_long cmd, caddr_t data,
 #ifdef __FreeBSD__
 	case FIONBIO:
 	case FIOASYNC:
-		ND("FIONBIO/FIOASYNC are no-ops");
+		/* FIONBIO/FIOASYNC are no-ops. */
 		break;
 
 	case BIOCIMMEDIATE:
 	case BIOCGHDRCMPLT:
 	case BIOCSHDRCMPLT:
 	case BIOCSSEESENT:
-		D("ignore BIOCIMMEDIATE/BIOCSHDRCMPLT/BIOCSHDRCMPLT/BIOCSSEESENT");
+		/* Ignore these commands. */
 		break;
 
 	default:	/* allow device-specific ioctls */
 	    {
 		struct nmreq *nmr = (struct nmreq *)data;
-		struct ifnet *ifp = ifunit_ref(nmr->nr_name);
+		if_t ifp = ifunit_ref(nmr->nr_name);
 		if (ifp == NULL) {
 			error = ENXIO;
 		} else {
 			struct socket so;
 
 			bzero(&so, sizeof(so));
-			so.so_vnet = ifp->if_vnet;
+			so.so_vnet = if_getvnet(ifp);
 			// so->so_proto not null.
 			error = ifioctl(&so, cmd, data, td);
 			if_rele(ifp);

@@ -135,7 +135,7 @@ typedef ULONG 			vm_ooffset_t;
  */
 #define destroy_dev(a)
 #define __user
-#define nm_iommu_group_id(dev)	0
+#define nm_iommu_group_id(dev)	-1
 
 
 /*
@@ -215,11 +215,12 @@ typedef struct _win_SELINFO
 	KGUARDED_MUTEX mutex;
 } win_SELINFO;
 
-static void
-nm_os_selinfo_init(win_SELINFO* queue)
+static int
+nm_os_selinfo_init(win_SELINFO* queue, const char *name)
 {
 	KeInitializeEvent(&queue->queue, NotificationEvent, TRUE);
 	KeInitializeGuardedMutex(&queue->mutex);
+	return 0;
 }
 
 static void nm_os_selinfo_uninit(win_SELINFO *queue) { /* XXX nothing to do here? */ }
@@ -266,7 +267,7 @@ static int time_uptime_w32()
 struct netmap_adapter;
 
 struct net_device {
-	char	if_xname[IFNAMSIZ];			// external name (name + unit)
+	char	name[IFNAMSIZ];			// external name (name + unit)
 	//        struct ifaltq if_snd;         /* output queue (includes altq) */
 	struct netmap_adapter	*na;
 	void	*pfilter;
@@ -364,7 +365,9 @@ void if_ref(struct net_device *ifp);
 
 PVOID send_up_to_stack(struct ifnet *ifp, struct mbuf *m, PVOID head);
 
-#define WNA(_ifp)		_ifp->na
+#define if_setnetmapadapter(_ifp, _na) do {				\
+	(_ifp)->na = _na;							\
+} while (0)
 #define NM_BNS_GET(b)	do { (void)(b); } while (0)
 #define NM_BNS_PUT(b)   do { (void)(b); } while (0)
 

@@ -1,4 +1,6 @@
-/*
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
+ *
  * Copyright (C) 2011-2014 Luigi Rizzo. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -24,7 +26,7 @@
  */
 
 /*
- * $FreeBSD: head/sys/dev/netmap/if_re_netmap.h 234225 2012-04-13 15:33:12Z luigi $
+ * $FreeBSD$
  *
  * netmap support for: re
  *
@@ -45,8 +47,8 @@
 static int
 re_netmap_reg(struct netmap_adapter *na, int onoff)
 {
-	struct ifnet *ifp = na->ifp;
-	struct rl_softc *adapter = ifp->if_softc;
+	if_t ifp = na->ifp;
+	struct rl_softc *adapter = if_getsoftc(ifp);
 
 	RL_LOCK(adapter);
 	re_stop(adapter); /* also clears IFF_DRV_RUNNING */
@@ -57,7 +59,7 @@ re_netmap_reg(struct netmap_adapter *na, int onoff)
 	}
 	re_init_locked(adapter);	/* also enables intr */
 	RL_UNLOCK(adapter);
-	return (ifp->if_drv_flags & IFF_DRV_RUNNING ? 0 : 1);
+	return (if_getdrvflags(ifp) & IFF_DRV_RUNNING ? 0 : 1);
 }
 
 
@@ -68,7 +70,7 @@ static int
 re_netmap_txsync(struct netmap_kring *kring, int flags)
 {
 	struct netmap_adapter *na = kring->na;
-	struct ifnet *ifp = na->ifp;
+	if_t ifp = na->ifp;
 	struct netmap_ring *ring = kring->ring;
 	u_int nm_i;	/* index into the netmap ring */
 	u_int nic_i;	/* index into the NIC ring */
@@ -77,7 +79,7 @@ re_netmap_txsync(struct netmap_kring *kring, int flags)
 	u_int const head = kring->rhead;
 
 	/* device-specific */
-	struct rl_softc *sc = ifp->if_softc;
+	struct rl_softc *sc = if_getsoftc(ifp);
 	struct rl_txdesc *txd = sc->rl_ldata.rl_tx_desc;
 
 	bus_dmamap_sync(sc->rl_ldata.rl_tx_list_tag,
@@ -170,17 +172,16 @@ static int
 re_netmap_rxsync(struct netmap_kring *kring, int flags)
 {
 	struct netmap_adapter *na = kring->na;
-	struct ifnet *ifp = na->ifp;
+	if_t ifp = na->ifp;
 	struct netmap_ring *ring = kring->ring;
 	u_int nm_i;	/* index into the netmap ring */
 	u_int nic_i;	/* index into the NIC ring */
-	u_int n;
 	u_int const lim = kring->nkr_num_slots - 1;
 	u_int const head = kring->rhead;
 	int force_update = (flags & NAF_FORCE_READ) || kring->nr_kflags & NKR_PENDINTR;
 
 	/* device-specific */
-	struct rl_softc *sc = ifp->if_softc;
+	struct rl_softc *sc = if_getsoftc(ifp);
 	struct rl_rxdesc *rxd = sc->rl_ldata.rl_rx_desc;
 
 	if (head > lim)
@@ -234,7 +235,7 @@ re_netmap_rxsync(struct netmap_kring *kring, int flags)
 	nm_i = kring->nr_hwcur;
 	if (nm_i != head) {
 		nic_i = netmap_idx_k2n(kring, nm_i);
-		for (n = 0; nm_i != head; n++) {
+		while (nm_i != head) {
 			struct netmap_slot *slot = &ring->slot[nm_i];
 			uint64_t paddr;
 			void *addr = PNMB(na, slot, &paddr);

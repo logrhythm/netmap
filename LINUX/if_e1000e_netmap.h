@@ -112,6 +112,66 @@ e1000_netmap_reg(struct netmap_adapter *na, int onoff)
 	return (0);
 }
 
+struct e1000e_netmap_szdesc {
+	uint32_t bufsize;
+	uint32_t rctl;
+};
+
+#define E1000_NETMAP_RCTL_MASK	0x7A030000
+static struct e1000e_netmap_szdesc e1000e_netmap_bufsize[] = {
+	{ 16384,	0x02010000},
+	{ 8192,		0x02020000},
+	{ 4096,		0x02030000},
+	{ 2048,		0x00000000},
+	{ 1024,		0x00010000},
+	{ 512,		0x00020000},
+	{ 256,		0x00030000},
+	{ 0,		0},
+};
+
+static uint32_t
+e1000e_netmap_get_rctl(uint32_t bufsize)
+{
+	struct e1000e_netmap_szdesc *sz;
+
+	for (sz = e1000e_netmap_bufsize; sz->bufsize; sz++)
+		if (bufsize == sz->bufsize)
+			return sz->rctl;
+
+	return ((bufsize >> 10) & 0xF) << 27;
+}
+
+static int
+e1000e_netmap_bufcfg(struct netmap_kring *kring, uint64_t target)
+{
+	uint64_t bufsz;
+	struct e1000e_netmap_szdesc *sz;
+
+	if (kring->tx == NR_TX) {
+		kring->hwbuf_len = target;
+		return 0;
+	}
+
+	bufsz = 0;
+	for (sz = e1000e_netmap_bufsize; sz->bufsize; sz++)
+		if (sz->bufsize <= target) {
+			bufsz = sz->bufsize;
+			break;
+		}
+	if (!bufsz)
+		return EINVAL;
+	/* check if we can find a better size using 1K increments */
+	target >>= 10;
+	if (target >= 1 && target <= 15) {
+		target <<= 10;
+		if (target > bufsz)
+			bufsz = target;
+	}
+	kring->hwbuf_len = bufsz;
+	kring->buf_align = 0; /* no alignment */
+	nm_prinf("%s: hwbuf_len %llu", kring->name, kring->hwbuf_len);
+	return 0;
+}
 
 /*
  * Reconcile kernel and user view of the transmit ring.
@@ -149,13 +209,14 @@ e1000_netmap_txsync(struct netmap_kring *kring, int flags)
 			struct netmap_slot *slot = &ring->slot[nm_i];
 			u_int len = slot->len;
 			uint64_t paddr;
-			void *addr = PNMB(na, slot, &paddr);
+			uint64_t offset = nm_get_offset(kring, slot);
 
 			/* device-specific */
 			struct e1000_tx_desc *curr = E1000_TX_DESC(*txr, nic_i);
 			int hw_flags = E1000_TXD_CMD_IFCS;
 
-			NM_CHECK_ADDR_LEN(na, addr, len);
+			PNMB(na, slot, &paddr);
+			NM_CHECK_ADDR_LEN_OFF(na, len, offset);
 
 			if (!(slot->flags & NS_MOREFRAG)) {
 				hw_flags |= adapter->txd_cmd;
@@ -163,15 +224,13 @@ e1000_netmap_txsync(struct netmap_kring *kring, int flags)
 				 * We may set it only if NS_REPORT is set or
 				 * at least once every half ring. */
 			}
-			if (slot->flags & NS_BUF_CHANGED) {
-				curr->buffer_addr = htole64(paddr);
-			}
 			slot->flags &= ~(NS_REPORT | NS_BUF_CHANGED | NS_MOREFRAG);
+			netmap_sync_map_dev(na, (bus_dma_tag_t) na->pdev, &paddr, len, NR_TX);
 
 			/* Fill the slot in the NIC ring. */
+			curr->buffer_addr = htole64(paddr + offset);
 			curr->upper.data = 0;
 			curr->lower.data = htole32(len | hw_flags);
-			netmap_sync_map_dev(na, (bus_dma_tag_t) na->pdev, &paddr, len, NR_TX);
 			nm_i = nm_next(nm_i, lim);
 			nic_i = nm_next(nic_i, lim);
 		}
@@ -181,7 +240,7 @@ e1000_netmap_txsync(struct netmap_kring *kring, int flags)
 
 		txr->next_to_use = nic_i; /* for consistency */
 		NM_WR_TX_TAIL(nic_i);
-		mmiowb(); /* needed after writing to TX ring tail */
+		wmb(); /* needed after writing to TX ring tail */
 	}
 
 	/*
@@ -196,7 +255,7 @@ e1000_netmap_txsync(struct netmap_kring *kring, int flags)
 		nic_i = NM_RD_TX_HEAD();
 		if (unlikely(nic_i >= kring->nkr_num_slots)) {
 			/* This should never happen. */
-			D("Warning: TDH wrap %d", nic_i);
+			nm_prerr("TDH wrap at idx %d", nic_i);
 			nic_i -= kring->nkr_num_slots;
 		}
 		nm_i = netmap_idx_n2k(kring, nic_i);
@@ -206,7 +265,7 @@ e1000_netmap_txsync(struct netmap_kring *kring, int flags)
 		for ( ; tosync != nm_i; tosync = nm_next(tosync, lim)) {
 			struct netmap_slot *slot = &ring->slot[tosync];
 			uint64_t paddr;
-			(void)PNMB(na, slot, &paddr);
+			(void)PNMB_O(kring, slot, &paddr);
 
 			netmap_sync_map_cpu(na, (bus_dma_tag_t) na->pdev,
 					&paddr, slot->len, NR_TX);
@@ -253,6 +312,7 @@ e1000_netmap_rxsync(struct netmap_kring *kring, int flags)
 	 */
 	if (netmap_no_pendintr || force_update) {
 		int strip_crc = (adapter->flags2 & FLAG2_CRC_STRIPPING) ? 0 : 4;
+		u_int new_hwtail = (u_int)-1;
 
 		nic_i = rxr->next_to_clean;
 		nm_i = netmap_idx_n2k(kring, nic_i);
@@ -262,21 +322,27 @@ e1000_netmap_rxsync(struct netmap_kring *kring, int flags)
 			uint32_t staterr = le32toh(curr->NM_E1R_RX_STATUS);
 			struct netmap_slot *slot = &ring->slot[nm_i];
 			uint64_t paddr;
+			int complete;
 
 			if ((staterr & E1000_RXD_STAT_DD) == 0)
 				break;
 			dma_rmb();  /* read descriptor after status DD */
-			PNMB(na, slot, &paddr);
+			PNMB_O(kring, slot, &paddr);
 			slot->len = le16toh(curr->NM_E1R_RX_LENGTH) - strip_crc;
-			slot->flags = (!(staterr & E1000_RXD_STAT_EOP) ? NS_MOREFRAG : 0);
+			complete = staterr & E1000_RXD_STAT_EOP;
+			slot->flags = complete ? NS_MOREFRAG : 0;
 			netmap_sync_map_cpu(na, (bus_dma_tag_t) na->pdev, &paddr,
 					slot->len, NR_RX);
 			nm_i = nm_next(nm_i, lim);
 			nic_i = nm_next(nic_i, lim);
+
+			if (complete)
+				new_hwtail = nm_i;
 		}
 		if (n) { /* update the state variables */
 			rxr->next_to_clean = nic_i;
-			kring->nr_hwtail = nm_i;
+			if (new_hwtail != (u_int)-1)
+				kring->nr_hwtail = nm_i;
 		}
 		kring->nr_kflags &= ~NKR_PENDINTR;
 	}
@@ -327,7 +393,7 @@ ring_reset:
 /* diagnostic routine to catch errors */
 static void e1000e_no_rx_alloc(struct SOFTC_T *a, int n)
 {
-	D("Error: alloc_rx_buf() should not be called");
+	nm_prerr("alloc_rx_buf() should not be called");
 }
 
 
@@ -336,45 +402,52 @@ static void e1000e_no_rx_alloc(struct SOFTC_T *a, int n)
  */
 static int e1000e_netmap_init_buffers(struct SOFTC_T *adapter)
 {
+	struct e1000_hw *hw = &adapter->hw;
 	struct ifnet *ifp = adapter->netdev;
 	struct netmap_adapter* na = NA(ifp);
+	struct netmap_kring *kring;
 	struct netmap_slot* slot;
 	struct e1000_ring *rxr = adapter->rx_ring;
-	struct e1000_ring *txr = adapter->tx_ring;
-	int i, si;
+	int i, si, n;
 	uint64_t paddr;
+	uint32_t rctl;
 
 	if (!nm_native_on(na))
 		return 0;
 
 	slot = netmap_reset(na, NR_RX, 0, 0);
 	if (slot) {
+		kring = na->rx_rings[0];
 		/* initialize the RX ring for netmap mode */
 		adapter->alloc_rx_buf = (void*)e1000e_no_rx_alloc;
-		for (i = 0; i < rxr->count; i++) {
+		/* preserve buffers already made available to clients */
+		n = rxr->count - 1 - nm_kr_rxspace(kring);
+		for (i = 0; i < n; i++) {
 			struct e1000_buffer *bi = &rxr->buffer_info[i];
-			si = netmap_idx_n2k(na->rx_rings[0], i);
-			PNMB(na, slot + si, &paddr);
+			si = netmap_idx_n2k(kring, i);
+			PNMB_O(kring, slot + si, &paddr);
 			if (bi->skb)
-				D("Warning: rx skb still set on slot #%d", i);
+				nm_prerr("Warning: rx skb still set on slot #%d", i);
 			E1000_RX_DESC_EXT(*rxr, i)->NM_E1R_RX_BUFADDR = htole64(paddr);
 		}
 		rxr->next_to_use = 0;
-		/* preserve buffers already made available to clients */
-		i = rxr->count - 1 - nm_kr_rxspace(na->rx_rings[0]);
+
+		/* program the RCTL */
+		rctl = er32(RCTL);
+		rctl = (rctl & ~E1000_NETMAP_RCTL_MASK) |
+			e1000e_netmap_get_rctl(kring->hwbuf_len);
+		ew32(RCTL, rctl);
+
 		wmb();	/* Force memory writes to complete */
-		NM_WR_RX_TAIL(i);
+		NM_WR_RX_TAIL(n);
 	}
 
-	slot = netmap_reset(na, NR_TX, 0, 0);
-	if (slot) {
-		/* initialize the tx ring for netmap mode */
-		for (i = 0; i < na->num_tx_desc; i++) {
-			si = netmap_idx_n2k(na->tx_rings[0], i);
-			PNMB(na, slot + si, &paddr);
-			E1000_TX_DESC(*txr, i)->buffer_addr = htole64(paddr);
-		}
-	}
+	netmap_reset(na, NR_TX, 0, 0);
+
+	/* no need to fill the tx ring, since txsync will always
+	 * overwrite the tx slots
+	 */
+
 	return 1;
 }
 
@@ -403,7 +476,7 @@ e1000_netmap_attach(struct SOFTC_T *adapter)
 
 	na.ifp = adapter->netdev;
 	na.pdev = &adapter->pdev->dev;
-	na.na_flags = NAF_MOREFRAG;
+	na.na_flags = NAF_MOREFRAG | NAF_OFFSETS;
 	na.num_tx_desc = adapter->tx_ring->count;
 	na.num_rx_desc = adapter->rx_ring->count;
 	na.num_tx_rings = na.num_rx_rings = 1;
@@ -412,6 +485,7 @@ e1000_netmap_attach(struct SOFTC_T *adapter)
 	na.nm_txsync = e1000_netmap_txsync;
 	na.nm_rxsync = e1000_netmap_rxsync;
 	na.nm_config = e1000e_netmap_config;
+	na.nm_bufcfg = e1000e_netmap_bufcfg;
 	netmap_attach(&na);
 }
 
