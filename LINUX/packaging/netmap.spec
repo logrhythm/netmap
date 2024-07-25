@@ -21,7 +21,7 @@ fi
 
 %build
 cd %{name}/LINUX/
-./configure --no-drivers --cc=/usr/local/gcc/bin/gcc
+./configure --no-drivers --cc=/usr/bin/gcc
 make CONFIG_MODULE_SIG=n
 
 %install
