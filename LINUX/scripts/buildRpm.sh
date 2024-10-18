@@ -15,7 +15,8 @@ echo "Building netmap version: $VERSION $BUILD"
 rm -rf ~/rpmbuild
 rpmdev-setuptree
 
-KERNEL=`uname -r`
+#KERNEL=`uname -r`
+KERNEL="5.14.0-427.31.1.el9_4.x86_64"
 sed -e 's/@KERNEL_VERSION@/'${KERNEL%.x86_64}'/g'  packaging/netmap.spec > ~/rpmbuild/SPECS/netmap.spec
 
 cd ..
