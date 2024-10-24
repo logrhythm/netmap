@@ -48,7 +48,7 @@ if [ $? -ne 0 ]
 then
    modprobe netmap
 fi
-|| :
+:
 %preun
 
 %postun
